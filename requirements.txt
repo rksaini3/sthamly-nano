@@ -1,0 +1,4 @@
+huggingface_hub>=0.24
+supabase>=2.5
+python-dotenv>=1.0
+datasets>=2.20
