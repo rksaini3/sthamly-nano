@@ -1,0 +1,12 @@
+node_modules/
+.next/
+.env
+.env.local
+llama.cpp/
+models/hf/
+models/gguf/
+data/
+__pycache__/
+*.gguf
+.venv/
+.DS_Store
