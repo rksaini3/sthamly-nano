@@ -2,6 +2,9 @@
 
 Usage:
     python scripts/compress_and_log.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0
+
+Note: the FP16 GGUF is kept (not deleted) after quantizing, because
+scripts/run_benchmark.py needs it as the baseline for comparison.
 """
 import argparse
 import json
@@ -69,7 +72,8 @@ def compress(model_id: str, hf_token: str | None = None):
 
     size_gb = round(out.stat().st_size / 1e9, 2)
     fp16_gb = round(f16.stat().st_size / 1e9, 2)
-    f16.unlink(missing_ok=True)
+    # NOTE: f16 is intentionally kept on disk here (not deleted) —
+    # scripts/run_benchmark.py needs it as the FP16 baseline for comparison.
 
     print("[5/5] Log to Supabase (scores fill in after scripts/run_benchmark.py)")
     row = {
