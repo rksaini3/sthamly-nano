@@ -5,8 +5,17 @@ node_modules/
 llama.cpp/
 models/hf/
 models/gguf/
-data/
+# data/ holds large downloaded text; only the tiny hand-written sample is tracked
+data/*
+!data/hindi_test.txt
 __pycache__/
 *.gguf
+*.imatrix
+*.kld
 .venv/
 .DS_Store
+# working output of the scripts (finished results are copied into results/ by hand)
+/results_trl4_*.json
+/report_trl4_*.txt
+/README_publish.md
+*.tsbuildinfo
