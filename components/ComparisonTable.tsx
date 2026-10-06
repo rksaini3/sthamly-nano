@@ -1,78 +1,104 @@
 import type { Model } from '@/lib/types'
+import { PAIRS, VARIANT_LABELS, VARIANT_ORDER, VERDICT_TEXT, compare, type Verdict } from '@/lib/verdict'
 
-type Scored = Model & {
-  hindi_score_fp16: number
-  hindi_score_standard_q4: number
-  hindi_score_hindi_q4: number
+const VERDICT_CLASS: Record<Verdict, string> = {
+  clear: 'text-green-400',
+  hint: 'text-amber-400',
+  none: 'text-gray-500',
 }
 
-// Perplexity: kam = behtar. Green sirf us variant ko jiska score sach me kam hai.
-// Barabar ho to koi rang nahi (neutral).
-function colorFor(value: number, other: number): string {
-  if (value < other) return 'text-green-400'
-  if (value > other) return 'text-red-400'
-  return 'text-gray-400'
-}
-
-function verdict(m: Scored): { text: string; cls: string } {
-  const diff = m.hindi_score_standard_q4 - m.hindi_score_hindi_q4
-  if (diff > 0) return { text: `Hindi-calibrated jeeta (${diff.toFixed(2)} behtar)`, cls: 'text-green-400' }
-  if (diff < 0) return { text: `Standard jeeta (${Math.abs(diff).toFixed(2)} behtar)`, cls: 'text-red-400' }
-  return { text: 'Barabar', cls: 'text-gray-400' }
-}
+const fmt = (m: [number, number], digits: number) => `${m[0].toFixed(digits)} ± ${m[1].toFixed(digits)}`
 
 export default function ComparisonTable({ models }: { models: Model[] | null }) {
-  const withScores = (models || []).filter(
-    (m): m is Scored =>
-      m.hindi_score_fp16 != null &&
-      m.hindi_score_standard_q4 != null &&
-      m.hindi_score_hindi_q4 != null
+  const measured = (models ?? []).filter(
+    (m) => m.results && Object.values(m.results).some((d) => d.standard && Object.keys(d).length > 1)
   )
 
-  if (withScores.length === 0) {
+  if (measured.length === 0) {
     return (
       <div className="border border-gray-800 rounded-lg p-6 text-gray-500">
-        Benchmark abhi pending hai. Jab scripts/run_benchmark.py se real score log honge,
-        tabhi yahan dikhenge. Koi number pehle se nahi dikhaya jaata.
+        Abhi koi measured result nahi hai. Number tabhi dikhte hain jab scripts/trl4_bench.py ka asli
+        output publish ho. Koi number pehle se nahi dikhaya jaata.
       </div>
     )
   }
 
   return (
-    <div>
-      <div className="overflow-x-auto border border-gray-800 rounded-lg">
-        <table className="min-w-full divide-y divide-gray-800 text-sm">
-          <thead className="bg-gray-900 text-gray-300">
-            <tr>
-              <th className="px-4 py-3 text-left">Model</th>
-              <th className="px-4 py-3 text-left">FP16 (original)</th>
-              <th className="px-4 py-3 text-left">Standard Q4</th>
-              <th className="px-4 py-3 text-left">Hindi-calibrated Q4</th>
-              <th className="px-4 py-3 text-left">Result</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-gray-800 text-gray-400">
-            {withScores.map((m) => {
-              const v = verdict(m)
-              return (
-                <tr key={m.id}>
-                  <td className="px-4 py-3 font-medium text-white">{m.model_name}</td>
-                  <td className="px-4 py-3">{m.hindi_score_fp16}</td>
-                  <td className={`px-4 py-3 ${colorFor(m.hindi_score_standard_q4, m.hindi_score_hindi_q4)}`}>
-                    {m.hindi_score_standard_q4}
-                  </td>
-                  <td className={`px-4 py-3 ${colorFor(m.hindi_score_hindi_q4, m.hindi_score_standard_q4)}`}>
-                    {m.hindi_score_hindi_q4}
-                  </td>
-                  <td className={`px-4 py-3 ${v.cls}`}>{v.text}</td>
-                </tr>
-              )
-            })}
-          </tbody>
-        </table>
-      </div>
-      <p className="mt-2 text-xs text-gray-500">
-        Perplexity score: kam = behtar. Hari value wahi hai jo sach me kam aayi.
+    <div className="space-y-10">
+      {measured.map((m) => {
+        const results = m.results!
+        const domains = Object.keys(results)
+        return (
+          <div key={m.id}>
+            <h3 className="text-lg font-semibold text-white mb-3">{m.model_name}</h3>
+
+            <div className="overflow-x-auto border border-gray-800 rounded-lg">
+              <table className="min-w-full divide-y divide-gray-800 text-sm">
+                <thead className="bg-gray-900 text-gray-300">
+                  <tr>
+                    <th className="px-4 py-3 text-left">Test set</th>
+                    <th className="px-4 py-3 text-left">Variant</th>
+                    <th className="px-4 py-3 text-left">KLD vs FP16 (kam = behtar)</th>
+                    <th className="px-4 py-3 text-left">Same top-p % (zyada = behtar)</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-800 text-gray-400">
+                  {domains.flatMap((d) =>
+                    VARIANT_ORDER.filter((v) => results[d][v]).map((v) => (
+                      <tr key={`${d}-${v}`}>
+                        <td className="px-4 py-2">{d}</td>
+                        <td className="px-4 py-2 text-white">{VARIANT_LABELS[v]}</td>
+                        <td className="px-4 py-2">{fmt(results[d][v].kld, 4)}</td>
+                        <td className="px-4 py-2">{fmt(results[d][v].top, 2)}</td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+
+            <h4 className="text-sm font-semibold text-gray-300 mt-5 mb-2">
+              Kaun kisse behtar (KLD, "saaf" = fark &gt; 2x error)
+            </h4>
+            <div className="overflow-x-auto border border-gray-800 rounded-lg">
+              <table className="min-w-full divide-y divide-gray-800 text-sm">
+                <thead className="bg-gray-900 text-gray-300">
+                  <tr>
+                    <th className="px-4 py-3 text-left">Muqabla</th>
+                    {domains.map((d) => (
+                      <th key={d} className="px-4 py-3 text-left">{d}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-800 text-gray-400">
+                  {PAIRS.map(([a, b]) => (
+                    <tr key={`${a}-${b}`}>
+                      <td className="px-4 py-2 text-white">
+                        {VARIANT_LABELS[a]} vs {VARIANT_LABELS[b]}
+                      </td>
+                      {domains.map((d) => {
+                        const ra = results[d][a]
+                        const rb = results[d][b]
+                        if (!ra || !rb) return <td key={d} className="px-4 py-2 text-gray-600">—</td>
+                        const c = compare(ra, rb, 'kld')
+                        return (
+                          <td key={d} className={`px-4 py-2 ${VERDICT_CLASS[c.verdict]}`}>
+                            {c.gain >= 0 ? '−' : '+'}
+                            {Math.abs(c.gain).toFixed(4)} ({VERDICT_TEXT[c.verdict]})
+                          </td>
+                        )
+                      })}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )
+      })}
+      <p className="text-xs text-gray-500">
+        Ye proxy naap hai (FP16 se distribution ka fark), asli Hindi task (sawal-jawab, summary) nahi.
+        Hari = saaf fark, peela = sirf ishara, dhundla = fark nahi.
       </p>
     </div>
   )
