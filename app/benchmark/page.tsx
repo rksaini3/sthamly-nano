@@ -1,23 +1,21 @@
-import { supabase } from '@/lib/supabase'
 import ComparisonTable from '@/components/ComparisonTable'
-import type { Model } from '@/lib/types'
+import { getModels } from '@/lib/supabase'
 
 export const revalidate = 60
 
 export default async function BenchmarkPage() {
-  const { data: models } = await supabase
-    .from('models')
-    .select('*')
-    .order('created_at', { ascending: false })
-    .returns<Model[]>()
+  const { models, error } = await getModels()
 
   return (
     <main className="min-h-screen p-8 max-w-5xl mx-auto">
       <h1 className="text-3xl font-bold mb-2">Hindi Benchmark</h1>
       <p className="text-gray-400 mb-8">
-        FP16 vs standard Q4 vs Hindi-calibrated Q4, hamare apne Hindi/Hinglish test set par.
-        Sirf measured results yahan dikhte hain — koi number pehle se nahi dikhaya jaata.
+        Plain Q4 vs Hindi / English / Mixed imatrix Q4, FP16 ke muqable (KLD), alag-alag Hindi test sets par.
+        Sirf measured results yahan dikhte hain. Fark tabhi &quot;saaf&quot; kehte hain jab wo error se 2x bada ho.
       </p>
+      {error && (
+        <div className="mb-8 border border-red-900 rounded-lg p-4 text-sm text-red-300">{error}</div>
+      )}
       <ComparisonTable models={models} />
     </main>
   )
