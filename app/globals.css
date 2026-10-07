@@ -1,3 +1,56 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/* Colors are RGB triplets so Tailwind can add opacity (bg-good/10). Light is the default;
+   dark follows the visitor's system setting. Meaning of the signal colors:
+   good = best / proven, bad = clearly behind, flat = cannot be told apart from the best, warn = only a hint. */
+:root {
+  --bg: 244 246 248;
+  --surface: 255 255 255;
+  --ink: 16 24 40;
+  --muted: 84 96 112;
+  --line: 217 224 232;
+  --good: 11 122 98;
+  --warn: 168 88 6;
+  --bad: 180 35 24;
+  --flat: 84 112 146;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: 13 18 23;
+    --surface: 21 28 36;
+    --ink: 232 237 242;
+    --muted: 150 163 178;
+    --line: 41 52 65;
+    --good: 52 211 168;
+    --warn: 245 166 35;
+    --bad: 248 120 113;
+    --flat: 128 160 196;
+    color-scheme: dark;
+  }
+}
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+  body {
+    font-variant-numeric: tabular-nums;
+    line-height: 1.6;
+  }
+  :focus-visible {
+    outline: 2px solid rgb(var(--ink));
+    outline-offset: 3px;
+    border-radius: 4px;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    * {
+      scroll-behavior: auto !important;
+      transition: none !important;
+      animation: none !important;
+    }
+  }
+}
