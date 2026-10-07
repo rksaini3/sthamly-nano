@@ -1,22 +1,26 @@
 import ComparisonTable from '@/components/ComparisonTable'
+import ErrorNote from '@/components/ErrorNote'
+import Main from '@/components/Main'
 import { getModels } from '@/lib/supabase'
 
 export const revalidate = 60
+
+export const metadata = { title: 'Hindi Benchmark: Sthamly NanoBrain' }
 
 export default async function BenchmarkPage() {
   const { models, error } = await getModels()
 
   return (
-    <main className="min-h-screen p-8 max-w-5xl mx-auto">
-      <h1 className="text-3xl font-bold mb-2">Hindi Benchmark</h1>
-      <p className="text-gray-400 mb-8">
-        Plain Q4 vs Hindi / English / Mixed imatrix Q4, FP16 ke muqable (KLD), alag-alag Hindi test sets par.
-        Sirf measured results yahan dikhte hain. Fark tabhi &quot;saaf&quot; kehte hain jab wo error se 2x bada ho.
-      </p>
-      {error && (
-        <div className="mb-8 border border-red-900 rounded-lg p-4 text-sm text-red-300">{error}</div>
-      )}
+    <Main>
+      <header className="mb-10 max-w-2xl">
+        <h1 className="font-display text-3xl sm:text-4xl font-bold tracking-tight">Hindi Benchmark</h1>
+        <p className="text-muted mt-3">
+          Plain Q4 ke muqable imatrix variants, FP16 ke saath naapa gaya, alag-alag Hindi test sets par. Pehle seedha
+          jawab (kaun kisse behtar), uske neeche poore numbers.
+        </p>
+      </header>
+      {error && <ErrorNote message={error} />}
       <ComparisonTable models={models} />
-    </main>
+    </Main>
   )
 }
