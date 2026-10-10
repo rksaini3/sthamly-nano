@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { compare, kldReductionPct } from './verdict'
+import { compare, kldReductionPct, leaderboardRows, orderedVariants, variantLabel } from './verdict'
 import type { Results } from './types'
 
 // Real numbers from results/results_trl4_Qwen__Qwen2.5-1.5B-Instruct.json
@@ -51,4 +51,32 @@ test('kldReductionPct matches the published model card (21% wiki, 10% sangraha)'
 
 test('kldReductionPct tolerates missing results', () => {
   assert.deepEqual(kldReductionPct(null), {})
+})
+
+test('variantLabel prefers custom label, then known label, then the key', () => {
+  assert.equal(variantLabel('hindi60'), 'Hindi imatrix')
+  assert.equal(variantLabel('x', { x: { label: 'My quant' } }), 'My quant')
+  assert.equal(variantLabel('unknown'), 'unknown')
+})
+
+test('orderedVariants: known order first, others A-Z', () => {
+  const v = r.wiki
+  const extra = { ...v, zeta: v.standard, alpha: v.standard }
+  assert.deepEqual(orderedVariants(extra), ['standard', 'hindi60', 'english60', 'alpha', 'zeta'])
+})
+
+test('leaderboardRows ranks by mean KLD and says who is clearly behind the best', () => {
+  const rows = leaderboardRows({ results: r, variants_meta: { hindi60: { size_gb: 1.12 } } })
+  assert.deepEqual(rows.map((x) => x.variant), ['hindi60', 'english60', 'standard'])
+  assert.ok(rows[0].isBest && rows[0].behindBest === 0)
+  assert.equal(rows[0].sizeGb, 1.12)
+  const std = rows.find((x) => x.variant === 'standard')!
+  assert.equal(std.behindBest, 2) // plain Q4 is clearly behind the best on both test sets
+  assert.equal(std.domains, 2)
+})
+
+test('leaderboardRows ignores quants that are not measured on every test set', () => {
+  const partial = { wiki: r.wiki, sangraha: { standard: r.sangraha.standard } }
+  assert.deepEqual(leaderboardRows({ results: partial, variants_meta: null }).map((x) => x.variant), ['standard'])
+  assert.deepEqual(leaderboardRows({ results: null, variants_meta: null }), [])
 })
