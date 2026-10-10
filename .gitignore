@@ -19,3 +19,6 @@ __pycache__/
 /report_trl4_*.txt
 /README_publish.md
 *.tsbuildinfo
+# worker / audit scratch output
+/work/
+/reports/
