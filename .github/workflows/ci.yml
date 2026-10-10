@@ -11,10 +11,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
-      - run: npm ci
+      # Uses the lockfile when it is committed; falls back to npm install until it is.
+      - run: |
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
       - run: npm run typecheck
       - run: npm test
+      # Runs db/schema.sql + db/schema_v3.sql in PGlite (Postgres in WASM): no server needed.
+      - run: npm run test:db
       # Builds with NO Supabase env on purpose: the site must degrade gracefully, not crash.
       - run: npm run build
 
@@ -26,3 +29,4 @@ jobs:
         with:
           python-version: "3.11"
       - run: python -m py_compile scripts/*.py
+      - run: python -W error::ResourceWarning -m unittest discover -s tests -v
