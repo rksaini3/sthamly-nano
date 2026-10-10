@@ -1,13 +1,17 @@
 {
   "name": "sthamly-nanobrain",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test lib/verdict.test.ts"
+    "test": "tsx --test lib/*.test.ts",
+    "test:db": "tsx --test db/tests/*.test.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",
@@ -16,6 +20,7 @@
     "react-dom": "^19.3.0"
   },
   "devDependencies": {
+    "@electric-sql/pglite": ">=0.3.0",
     "@types/node": "^20.14.0",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
