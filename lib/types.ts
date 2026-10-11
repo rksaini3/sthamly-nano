@@ -10,12 +10,8 @@ export interface VariantResult {
 /** domain -> variant -> measurements. Shape written by scripts/trl4_bench.py and scripts/audit.py */
 export type Results = Record<string, Record<string, VariantResult>>
 
-/** Optional per-variant extras (display name, file size). Written by scripts/audit.py. */
-export interface VariantMeta {
-  label?: string
-  size_gb?: number | null
-}
-export type VariantsMeta = Record<string, VariantMeta>
+/** Optional per-variant extras (scripts/audit.py writes these). */
+export type VariantsMeta = Record<string, { size_gb?: number | null; source?: string | null }>
 
 export interface Model {
   id: string
