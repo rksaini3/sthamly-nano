@@ -1,7 +1,7 @@
-import type { Model, Results, VariantResult, VariantsMeta } from '@/lib/types'
+import type { Metric, Model, Results, VariantResult } from '@/lib/types'
 
-// Same rule as scripts/trl4_bench.py and scripts/worker.py: a difference only counts as "clear"
-// when it is more than 2x its combined error. Anything smaller is a hint at best.
+// Same rule as scripts/trl4_bench.py: a difference only counts as "clear" when it is
+// more than 2x its combined error. Anything smaller is a hint at best.
 export type Verdict = 'clear' | 'hint' | 'none'
 type Key = 'kld' | 'top'
 
@@ -12,7 +12,7 @@ export const VARIANT_LABELS: Record<string, string> = {
   hindi60: 'Hindi imatrix',
   english60: 'English imatrix',
   mixed60: 'Mixed imatrix',
-  plain: 'Plain Q4',
+  plain: 'Plain Q4', // label used by scripts/audit.py runs (scripts/worker.py)
 }
 
 export const VERDICT_TEXT: Record<Verdict, string> = {
@@ -21,18 +21,17 @@ export const VERDICT_TEXT: Record<Verdict, string> = {
   none: 'fark nahi',
 }
 
-/** Display name of a variant: custom label (audit uploads) > known label > the raw key. */
-export function variantLabel(variant: string, meta?: VariantsMeta | null): string {
-  return meta?.[variant]?.label ?? VARIANT_LABELS[variant] ?? variant
+/** Human label for a variant key; audit.py labels (e.g. "bartowski-Q4_K_M") are shown as they are. */
+export function variantLabel(key: string): string {
+  return VARIANT_LABELS[key] ?? key
 }
 
-/** Variant keys of one test set: the known ones in their fixed order, then any others A-Z. */
-export function orderedVariants(byVariant: Record<string, VariantResult>): string[] {
-  const known = (VARIANT_ORDER as readonly string[]).filter((v) => byVariant[v])
-  const rest = Object.keys(byVariant)
-    .filter((v) => !(VARIANT_ORDER as readonly string[]).includes(v))
-    .sort()
-  return [...known, ...rest]
+/** Known variants first (in a fixed order), then any custom ones in their stored order. */
+export function orderedVariants(byVariant: Record<string, unknown>): string[] {
+  const keys = Object.keys(byVariant)
+  const known = VARIANT_ORDER.filter((v) => keys.includes(v)) as string[]
+  const other = keys.filter((k) => !(VARIANT_ORDER as readonly string[]).includes(k))
+  return [...known, ...other]
 }
 
 /** How much better `a` is than `b` (positive = a better), its error, and the verdict. */
@@ -44,7 +43,7 @@ export function compare(a: VariantResult, b: VariantResult, key: Key = 'kld') {
   return { gain, err, verdict }
 }
 
-/** The comparisons shown on the site: [a, b] means "a vs b". */
+/** The comparisons shown on the benchmark page: [a, b] means "a vs b". */
 export const PAIRS: ReadonlyArray<readonly [string, string]> = [
   ['hindi60', 'standard'],
   ['english60', 'standard'],
@@ -52,7 +51,7 @@ export const PAIRS: ReadonlyArray<readonly [string, string]> = [
   ['mixed60', 'english60'],
 ]
 
-/** Relative KLD reduction of `variant` vs plain Q4, per domain, in percent (null if not measured). */
+/** Relative KLD reduction of `variant` vs plain Q4, per domain, in percent (omitted if not measured). */
 export function kldReductionPct(results: Results | null, variant = 'hindi60'): Record<string, number> {
   const out: Record<string, number> = {}
   for (const [domain, byVariant] of Object.entries(results ?? {})) {
@@ -66,53 +65,49 @@ export function kldReductionPct(results: Results | null, variant = 'hindi60'): R
 export interface LeaderboardRow {
   variant: string
   label: string
-  sizeGb: number | null
-  /** mean KLD over the test sets */
-  kld: number
-  /** error of that mean (combined error of the per-set errors, divided by the number of sets) */
-  kldErr: number
   isBest: boolean
-  /** number of test sets on which the best row is clearly better than this row */
+  kld: number // mean over test sets (lower = better)
+  kldErr: number
+  top: number // mean same-top-p % over test sets (higher = better)
+  perDomain: Record<string, Metric>
+  sizeGb: number | null
+  /** number of test sets where the best row is CLEARLY better than this row */
   behindBest: number
-  /** number of test sets the row was measured on */
   domains: number
 }
 
 /**
- * One row per quant that was measured on EVERY test set, best (lowest mean KLD) first.
- * Rank is only meaningful inside one model: every row shares that model's FP16 reference.
+ * One table per model, ranked by mean KLD over its test sets. Only variants measured on
+ * every test set are ranked. Ranks are only meaningful within one model (the same FP16
+ * reference), so this never mixes different base models.
  */
 export function leaderboardRows(model: Pick<Model, 'results' | 'variants_meta'>): LeaderboardRow[] {
   const results = model.results
   if (!results) return []
   const domains = Object.keys(results)
   if (domains.length === 0) return []
-  const common = Object.keys(results[domains[0]]).filter((v) => domains.every((d) => results[d][v]))
 
-  const rows: LeaderboardRow[] = common.map((variant) => {
-    const k = domains.map((d) => results[d][variant].kld)
-    return {
-      variant,
-      label: variantLabel(variant, model.variants_meta),
-      sizeGb: model.variants_meta?.[variant]?.size_gb ?? null,
-      kld: k.reduce((s, x) => s + x[0], 0) / k.length,
-      kldErr: Math.sqrt(k.reduce((s, x) => s + x[1] ** 2, 0)) / k.length,
-      isBest: false,
-      behindBest: 0,
-      domains: domains.length,
-    }
-  })
-  rows.sort((a, b) => a.kld - b.kld || a.variant.localeCompare(b.variant))
+  const variants = orderedVariants(results[domains[0]] ?? {}).filter((v) => domains.every((d) => results[d]?.[v]))
+  const n = domains.length
+  const rows: LeaderboardRow[] = variants.map((v) => ({
+    variant: v,
+    label: variantLabel(v),
+    isBest: false,
+    kld: domains.reduce((s, d) => s + results[d][v].kld[0], 0) / n,
+    kldErr: Math.sqrt(domains.reduce((s, d) => s + results[d][v].kld[1] ** 2, 0)) / n,
+    top: domains.reduce((s, d) => s + results[d][v].top[0], 0) / n,
+    perDomain: Object.fromEntries(domains.map((d) => [d, results[d][v].kld])),
+    sizeGb: model.variants_meta?.[v]?.size_gb ?? null,
+    behindBest: 0,
+    domains: n,
+  }))
+  rows.sort((a, b) => a.kld - b.kld)
+  if (rows.length === 0) return rows
 
   const best = rows[0]
-  if (best) {
-    for (const r of rows) {
-      r.isBest = r === best
-      r.behindBest =
-        r === best
-          ? 0
-          : domains.filter((d) => compare(results[d][best.variant], results[d][r.variant]).verdict === 'clear').length
-    }
+  best.isBest = true
+  for (const r of rows.slice(1)) {
+    r.behindBest = domains.filter((d) => compare(results[d][best.variant], results[d][r.variant], 'kld').verdict === 'clear').length
   }
   return rows
 }
