@@ -4,7 +4,7 @@ import { isUuid, normalizeModelId, type JobData } from '@/lib/jobs'
 export type CreateResult = { ok: true; id: string; deduped: boolean } | { ok: false; code: string }
 export type FetchResult = { ok: true; job: JobData | null } | { ok: false; message: string }
 
-/** Starts a free audit (RPC create_audit_job). `code` is invalid_model, rate_limited or queue_full. */
+/** Starts a free audit (RPC create_audit_job). On failure `code` is invalid_model, rate_limited, queue_full or not_configured. */
 export async function createAuditJob(input: string): Promise<CreateResult> {
   const model = normalizeModelId(input)
   if (!model) return { ok: false, code: 'invalid_model' }
@@ -17,7 +17,7 @@ export async function createAuditJob(input: string): Promise<CreateResult> {
   return { ok: true, id: row.id, deduped: Boolean(row.deduped) }
 }
 
-/** Reads one job (RPC get_job). `job` is null if it does not exist or has expired. */
+/** Reads one job (RPC get_job). `job` is null if it does not exist or has been deleted. Never throws on a bad id. */
 export async function fetchJob(id: string): Promise<FetchResult> {
   if (!isUuid(id)) return { ok: true, job: null }
   const sb = getClient()
