@@ -1,42 +1,59 @@
-export interface Rung {
+// The commercial ladder from docs/PLAN.md. Edit prices / wording here; the home page reads this file.
+// Prices are starting proposals: confirm them with real customers before treating them as final.
+export interface LadderStep {
+  step: string
   name: string
   what: string
   price: string
-  /** small print shown under the rung */
+  /** small print under the step */
   note?: string
 }
 
-/** What a visitor can take, cheapest first. Prices are a starting point, to be settled with real customers. */
-export const LADDER: Rung[] = [
+export const LADDER: LadderStep[] = [
   {
+    step: 'Step 0',
     name: 'Public Hindi Quant Report',
-    what: 'Quantized models FP16 se Hindi par kitna door hain: naapa hua, error bars ke saath. Kholkar padho.',
+    what: 'Leaderboard par measured numbers + Hugging Face par ek model. Koi sign-up nahi.',
     price: 'Free',
   },
   {
+    step: 'Step 1',
     name: 'Free Hindi audit (aapka model)',
-    what: 'Public Hugging Face model ka plain Q4 FP16 ke muqable Hindi par naapkar report. Aapke system me kuch badalna nahi.',
+    what: 'Public Hugging Face model ka plain Q4, usi FP16 ke muqable do Hindi test sets par naapkar report, error bars ke saath. Aapke system me kuch badalna nahi.',
     price: 'Free (din me 3 tak)',
   },
   {
-    name: 'Calibrated Q4 (self-serve)',
+    step: 'Step 2',
+    name: 'Calibrated Q4 (ek model)',
     what: 'Hindi, English aur Mixed imatrix teeno naapkar jo best nikle wo. Fayda tabhi likha jaata hai jab naap use saaf dikhaye.',
-    price: 'Rs 399 per model',
-    note: 'Shuruaati price. GST, gateway fee aur GPU kharch ka hisaab abhi khula hai; pehle customers se manual UPI.',
+    price: '₹399 per model',
+    note: 'Shuruaati price. GST, payment fee aur GPU kharch ka hisaab abhi khula hai; shuru me payment haath se (UPI).',
   },
   {
-    name: 'Apne data par calibration',
-    what: 'Aapke kaam ke text (kaanooni, vitteey, internal) se imatrix aur usi par naap. Baat karke tay hota hai.',
-    price: 'Baat karke',
+    step: 'Step 3',
+    name: 'Hindi Audit Report (PDF)',
+    what: 'Aapke quantized model ka PDF: FP16 se KLD (error bars ke saath) aur model ki seemaayein. Aapke system me kuch badalna nahi.',
+    price: '₹3,000 – ₹5,000',
+  },
+  {
+    step: 'Step 4',
+    name: 'Full Package',
+    what: 'Audit + imatrix calibration (Hindi, English, Mixed ko naapkar best chuna) + compression + speed report.',
+    price: '₹15,000 (one-time)',
+  },
+  {
+    step: 'Step 5',
+    name: 'Retainer',
+    what: 'Naya model aane par dobara compress, calibrate aur benchmark. Baad me, jab Step 4 ke customers ho jayein.',
+    price: '₹5,000 / month',
   },
 ]
 
-/** Claims this project must not make. Shown on the home page. */
-export const NOT_CLAIMED: string[] = [
-  'Hindi task (sawal-jawab, summary, translation) par accuracy: abhi naapi nahi gayi. KLD sirf FP16 se distribution ka fark hai.',
-  'Hindi text se calibrate karna English se alag se behtar hai: kisi test set me saaf fark nahi mila.',
+// Shown on the home page so nobody has to guess what we do NOT claim.
+export const NOT_CLAIMED = [
+  'Hindi text se calibrate karna English se behtar hai: abhi saabit nahi (Qwen2.5-1.5B par dono lagbhag barabar).',
+  'Real Hindi task (QA, summary) par quality: abhi naapi nahi gayi, sirf KLD proxy hai.',
   'Imatrix ka fayda har model par hota hai: sirf Qwen2.5-1.5B par naapa hai, doosre models par alag ho sakta hai.',
-  'Cloud use karne par DPDP ke tahat jurmana: ye galat hai. Sahi bas itna: data on-device rakhna aasaan banata hai.',
-  '"Zero data leaks": hum ye nahi kehte. Desk app aaye to bhi chat aur documents device se bahar nahi jaate (activation ke alawa).',
-  'Legal ya financial salah: koi bhi output professional se verify karwana zaroori hai.',
+  'Koi number bina measurement ke nahi dikhaya jata.',
+  'Desk app abhi bana nahi hai. Aane par bhi: drafting aur analysis sahayak, kanooni ya vitteey salah nahi; output verify karna zaroori hai.',
 ]
