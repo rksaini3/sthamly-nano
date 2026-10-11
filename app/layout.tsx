@@ -56,12 +56,12 @@ export default function RootLayout({ children }: { children: ReactNode }) {
                 Sthamly<span className="hidden text-muted sm:inline"> NanoBrain</span>
               </span>
             </Link>
-            <ul className="flex items-center gap-1 text-sm sm:gap-2">
+            <ul className="flex items-center text-[0.8rem] sm:gap-2 sm:text-sm">
               {NAV.map((n) => (
                 <li key={n.href}>
                   <Link
                     href={n.href}
-                    className="inline-block rounded-md px-2.5 py-2 text-muted transition-colors hover:bg-raised hover:text-ink"
+                    className="inline-block rounded-md px-1 py-2 text-muted transition-colors hover:bg-raised hover:text-ink sm:px-2.5"
                   >
                     {n.label}
                   </Link>
