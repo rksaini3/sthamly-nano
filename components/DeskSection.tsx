@@ -1,4 +1,5 @@
 import DeskPreview from '@/components/DeskPreview'
+import { safeLink } from '@/lib/jobs'
 
 const STEPS = [
   { title: 'App kholo', text: 'Computer par Sthamly Desk chalao.' },
@@ -9,12 +10,12 @@ const STEPS = [
 
 /**
  * Desktop app hub. The installer does not exist yet, so there is no fake download link:
- * real buttons appear only when NEXT_PUBLIC_DESK_WIN_URL / NEXT_PUBLIC_DESK_MAC_URL are set.
+ * real buttons appear only when NEXT_PUBLIC_DESK_WIN_URL / NEXT_PUBLIC_DESK_MAC_URL hold a real link.
  */
 export default function DeskSection() {
-  const win = process.env.NEXT_PUBLIC_DESK_WIN_URL
-  const mac = process.env.NEXT_PUBLIC_DESK_MAC_URL
-  const contact = process.env.NEXT_PUBLIC_CONTACT_URL
+  const win = safeLink(process.env.NEXT_PUBLIC_DESK_WIN_URL)
+  const mac = safeLink(process.env.NEXT_PUBLIC_DESK_MAC_URL)
+  const contact = safeLink(process.env.NEXT_PUBLIC_CONTACT_URL)
 
   const platforms = [
     { name: 'Windows', file: '.exe', url: win },
