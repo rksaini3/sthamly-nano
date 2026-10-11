@@ -13,6 +13,7 @@ Next:
     python scripts/trl4_bench.py --model Qwen/Qwen2.5-1.5B-Instruct
 """
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -36,6 +37,29 @@ def run(cmd):
         sys.exit(f"FAILED: {' '.join(cmd[:3])} ...")
 
 
+CUSTOM_CODE_EXIT = 3  # scripts/worker.py turns this exit code into a polite refusal for the visitor
+
+
+def refuse_custom_code(model_dir: Path) -> None:
+    """Stop if the repo points at custom code (`auto_map`) or has a config we cannot read.
+
+    Only json, safetensors and tokenizer files are downloaded (no .py), but a loader with trust_remote_code
+    could still fetch the code named in auto_map. This project never runs another person's code.
+    """
+    for name in ("config.json", "tokenizer_config.json"):
+        f = model_dir / name
+        if not f.exists():
+            continue
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except ValueError:
+            print(f"REFUSED: {name} padha nahi ja sakta.")
+            sys.exit(CUSTOM_CODE_EXIT)
+        if isinstance(data, dict) and "auto_map" in data:
+            print(f"REFUSED: {name} me auto_map hai (custom code).")
+            sys.exit(CUSTOM_CODE_EXIT)
+
+
 def prepare(model_id: str, hf_token: str | None):
     for need in (CONVERT, QUANTIZE):
         if not need.exists():
@@ -51,6 +75,8 @@ def prepare(model_id: str, hf_token: str | None):
     print("[1/3] Download")
     snapshot_download(repo_id=model_id, local_dir=str(local), token=hf_token,
                       allow_patterns=["*.json", "*.safetensors", "*.model", "*.txt", "*.tiktoken"])
+
+    refuse_custom_code(local)
 
     print("[2/3] Convert to FP16 GGUF")
     if f16.exists():
