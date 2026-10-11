@@ -4,7 +4,7 @@ import { chartData } from '@/lib/chart'
 import { findings, type Finding } from '@/lib/findings'
 import { outOf100, type AuditResult, type CalibrateResult } from '@/lib/jobs'
 import { domainName } from '@/lib/labels'
-import { kldReductionPct, orderedVariants, variantLabel, type Verdict } from '@/lib/verdict'
+import { orderedVariants, variantLabel, type Verdict } from '@/lib/verdict'
 
 const TONE_BAR: Record<Verdict, string> = { clear: 'bg-good', hint: 'bg-warn', none: 'bg-flat' }
 const TONE_TEXT: Record<Verdict, string> = { clear: 'text-good', hint: 'text-warn', none: 'text-muted' }
@@ -14,7 +14,7 @@ const fmt = (m: [number, number], digits: number) => `${m[0].toFixed(digits)} ±
 function Findings({ items }: { items: Finding[] }) {
   if (items.length === 0) return null
   return (
-    <ul className="mt-4 space-y-3">
+    <ul className="space-y-3">
       {items.map((f) => (
         <li key={f.text} className="flex gap-3">
           <span className={`mt-1 w-1 shrink-0 rounded-full ${TONE_BAR[f.tone]}`} aria-hidden />
@@ -28,10 +28,10 @@ function Findings({ items }: { items: Finding[] }) {
   )
 }
 
-/** Free audit: how far each measured quant is from FP16, per test set. No High/Low verdicts on purpose. */
+/** Free audit: how far plain Q4 is from FP16, per test set. No High/Low verdicts on purpose. */
 export function AuditResultView({ result }: { result: AuditResult }) {
   const domains = Object.keys(result.results)
-  const model = { results: result.results, variants_meta: result.variants_meta }
+  const model = { results: result.results, variants_meta: null }
 
   return (
     <section aria-labelledby="audit-result-title" className="space-y-6">
@@ -40,14 +40,17 @@ export function AuditResultView({ result }: { result: AuditResult }) {
           Hindi audit: FP16 se doori
         </h2>
         <p className="mt-1 max-w-2xl text-sm text-muted">
-          {result.model}, {result.chunks} chunks par naapa. KLD kam = FP16 ke kareeb. &quot;FP16 jaisa agla token&quot; =
-          100 jagah me se kitni baar quantized model ne wahi sabse-sambhav token chuna jo FP16 ne chuna.
+          {result.model}, {result.chunks} chunks par naapa
+          {result.fp16_gb ? ` (FP16 ${result.fp16_gb} GB` : ''}
+          {result.fp16_gb && result.quant_gb ? `, Q4 ${result.quant_gb} GB)` : result.fp16_gb ? ')' : ''}. KLD kam = FP16 ke
+          kareeb. &quot;FP16 jaisa agla token&quot; = 100 jagah me se kitni baar quantized model ne wahi sabse-sambhav token
+          chuna jo FP16 ne chuna.
         </p>
       </div>
 
       <div className="overflow-x-auto rounded-lg border border-line bg-surface">
         <table className="w-full text-sm">
-          <caption className="sr-only">Har test set par har quant ka KLD aur FP16 jaisa agla token</caption>
+          <caption className="sr-only">Har test set par plain Q4 ka KLD aur FP16 jaisa agla token</caption>
           <thead className="border-b border-line text-left text-muted">
             <tr>
               <th scope="col" className="px-3 py-3 font-medium sm:px-4">Test set</th>
@@ -64,9 +67,9 @@ export function AuditResultView({ result }: { result: AuditResult }) {
                   <tr key={`${d}-${v}`}>
                     <td className="px-3 py-2.5 text-muted sm:px-4">
                       {domainName(d)}
-                      {result.lines[d] ? <span className="block text-xs">{result.lines[d]} lines</span> : null}
+                      {result.domains?.[d] ? <span className="block text-xs">{result.domains[d]} lines</span> : null}
                     </td>
-                    <td className="px-3 py-2.5 font-medium sm:px-4">{variantLabel(v, result.variants_meta)}</td>
+                    <td className="px-3 py-2.5 font-medium sm:px-4">{variantLabel(v)}</td>
                     <td className="whitespace-nowrap px-3 py-2.5 sm:px-4">{fmt(m.kld, 4)}</td>
                     <td className="whitespace-nowrap px-3 py-2.5 sm:px-4">
                       ~{outOf100(m.top[0])}/100 baar <span className="text-muted">(± {m.top[1].toFixed(2)}%)</span>
@@ -87,33 +90,38 @@ export function AuditResultView({ result }: { result: AuditResult }) {
 
       <p className="max-w-2xl text-xs text-muted">
         Ye proxy naap hai (FP16 se distribution ka fark), asli Hindi task nahi. KLD alag models me aapas me compare nahi
-        hota, isliye hum isse &quot;achha&quot; ya &quot;kharab&quot; ka label nahi dete. Is model par plain Q4 ke saath imatrix
-        calibration se fayda hoga ya nahi, ye alag naap se hi pata chalega.
+        hota, isliye hum isse &quot;achha&quot; ya &quot;kharab&quot; ka label nahi dete. Is model par imatrix calibration
+        se fayda hoga ya nahi, ye alag naap se hi pata chalega.{' '}
+        <Link className="underline underline-offset-2" href="/">Home par wapas</Link>
       </p>
     </section>
   )
 }
 
-/** Calibration: plain Q4 vs the best imatrix variant, said only as far as the numbers go. */
+/** Calibration: plain Q4 against the best imatrix variant, said only as far as the numbers go. */
 export function CalibrateResultView({ result, contact }: { result: CalibrateResult; contact?: string }) {
-  const model = { results: result.results, variants_meta: result.variants_meta }
-  const improved = result.outcome === 'improved' && result.best !== null
+  const model = { results: result.results, variants_meta: null }
   const best = result.best
-  const gains = best ? Object.entries(kldReductionPct(result.results, best)) : []
+  const improved = result.decision === 'improved' && best !== null
   const domains = Object.keys(result.results)
+  const bestName = best ? variantLabel(best) : '—'
 
   return (
     <section aria-labelledby="cal-result-title" className="space-y-6">
       <div>
         <h2 id="cal-result-title" className="font-display text-2xl font-semibold">
-          {improved && best ? `${variantLabel(best, result.variants_meta)} se behtar Q4 mila` : 'Is model par saaf fayda nahi dikha'}
+          {improved ? `${bestName} se behtar Q4 mila` : 'Is model par saaf fayda nahi dikha'}
         </h2>
         <p className="mt-2 max-w-2xl text-sm">
           {improved ? (
             <>
-              Plain Q4 ke muqable KLD kam hua: {gains.map(([d, g]) => `${domainName(d)} ${g.toFixed(0)}%`).join(', ')}.{' '}
-              Ye {result.model} par, {result.chunks} chunks aur chhote test sets par naapa gaya hai; doosre models par
-              alag ho sakta hai.
+              Plain Q4 ke muqable KLD kam hua:{' '}
+              {Object.entries(result.reduction_pct)
+                .map(([d, g]) => `${domainName(d)} ${g.toFixed(0)}% (${result.clear_domains.includes(d) ? 'saaf' : 'saaf nahi'})`)
+                .join(', ')}
+              . &quot;Best&quot; wo hai jiska dono test sets ka average KLD sabse kam hai; Hindi, English aur Mixed ke beech ka fark
+              aksar error ke andar hota hai (neeche dekho). Ye {result.model} par, chhote test sets par naapa gaya hai;
+              doosre models par alag ho sakta hai.
             </>
           ) : (
             <>Imatrix variants plain Q4 se saaf behtar nahi nikle (ya kisi test set me saaf kharab nikle). Plain Q4 hi rakho.</>
@@ -128,9 +136,7 @@ export function CalibrateResultView({ result, contact }: { result: CalibrateResu
             <tr>
               <th scope="col" className="px-3 py-3 font-medium sm:px-4">Test set</th>
               <th scope="col" className="whitespace-nowrap px-3 py-3 font-medium sm:px-4">Pehle: Plain Q4</th>
-              <th scope="col" className="whitespace-nowrap px-3 py-3 font-medium sm:px-4">
-                Baad me: {best ? variantLabel(best, result.variants_meta) : '—'}
-              </th>
+              <th scope="col" className="whitespace-nowrap px-3 py-3 font-medium sm:px-4">Baad me: {bestName}</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-line">
@@ -159,11 +165,9 @@ export function CalibrateResultView({ result, contact }: { result: CalibrateResu
 
       {improved && (
         <p className="text-sm">
-          GGUF file abhi haath se bheji jaati hai.{' '}
+          GGUF file abhi haath se bheji jaati hai, aur 2 ghante baad hamare paas se delete ho jaati hai.{' '}
           {contact ? (
-            <a className="underline underline-offset-2" href={contact}>
-              File maangne ke liye contact karo
-            </a>
+            <a className="underline underline-offset-2" href={contact}>File maangne ke liye contact karo</a>
           ) : (
             'Contact link abhi set nahi hai.'
           )}
