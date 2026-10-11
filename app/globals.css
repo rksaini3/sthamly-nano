@@ -2,47 +2,49 @@
 @tailwind components;
 @tailwind utilities;
 
-/* Colors are RGB triplets so Tailwind can add opacity (bg-good/10). Light is the default;
-   dark follows the visitor's system setting. Meaning of the signal colors:
-   good = best / proven, bad = clearly behind, flat = cannot be told apart from the best, warn = only a hint. */
+/* Sthamly palette: deep navy base, saffron for the one main action, sky blue for the "terminal" voice.
+   Colors are RGB triplets so Tailwind can add opacity (bg-good/15). All text pairs are WCAG AA or better
+   (lowest: muted on raised = 6.4:1).
+   Signal colors: good = best / proven, bad = clearly behind, flat = cannot be told apart from the best,
+   warn = only a hint. Saffron (brand) is never used as a signal, only for the main button and the logo. */
 :root {
-  --bg: 244 246 248;
-  --surface: 255 255 255;
-  --ink: 16 24 40;
-  --muted: 84 96 112;
-  --line: 217 224 232;
-  --good: 11 122 98;
-  --warn: 168 88 6;
-  --bad: 180 35 24;
-  --flat: 84 112 146;
-  color-scheme: light;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: 13 18 23;
-    --surface: 21 28 36;
-    --ink: 232 237 242;
-    --muted: 150 163 178;
-    --line: 41 52 65;
-    --good: 52 211 168;
-    --warn: 245 166 35;
-    --bad: 248 120 113;
-    --flat: 128 160 196;
-    color-scheme: dark;
-  }
+  --bg: 8 12 22;
+  --term: 5 8 16;
+  --surface: 15 22 38;
+  --raised: 22 31 52;
+  --line: 38 50 77;
+  --ink: 234 240 250;
+  --muted: 148 163 190;
+  --brand: 255 138 61;
+  --brand-ink: 26 14 2;
+  --accent: 125 211 252;
+  --good: 52 211 153;
+  --warn: 250 204 21;
+  --bad: 255 122 122;
+  --flat: 124 140 168;
+  color-scheme: dark;
 }
 
 @layer base {
   html {
     -webkit-text-size-adjust: 100%;
+    scroll-behavior: smooth;
+    scroll-padding-top: 4.5rem; /* anchors land below the sticky header */
   }
   body {
+    background-color: rgb(var(--bg));
+    background-image:
+      radial-gradient(900px 420px at 85% -80px, rgb(var(--brand) / 0.13), transparent 70%),
+      radial-gradient(700px 380px at 0% -60px, rgb(var(--accent) / 0.08), transparent 70%);
+    background-repeat: no-repeat;
     font-variant-numeric: tabular-nums;
     line-height: 1.6;
   }
+  ::selection {
+    background: rgb(var(--accent) / 0.35);
+  }
   :focus-visible {
-    outline: 2px solid rgb(var(--ink));
+    outline: 2px solid rgb(var(--accent));
     outline-offset: 3px;
     border-radius: 4px;
   }
@@ -51,6 +53,84 @@
       scroll-behavior: auto !important;
       transition: none !important;
       animation: none !important;
+    }
+  }
+}
+
+/* Plain CSS on purpose (no @apply): nothing here can break the Tailwind build. */
+@layer components {
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    border-radius: 0.625rem;
+    border: 1px solid transparent;
+    padding: 0.7rem 1.25rem;
+    font-size: 0.9rem;
+    font-weight: 600;
+    line-height: 1.2;
+    text-align: center;
+    transition: transform 0.15s ease, background-color 0.15s ease, border-color 0.15s ease, filter 0.15s ease;
+  }
+  .btn:active:not(:disabled) {
+    transform: translateY(1px);
+  }
+  .btn-primary {
+    background: rgb(var(--brand));
+    color: rgb(var(--brand-ink));
+  }
+  .btn-primary:hover:not(:disabled) {
+    filter: brightness(1.08);
+  }
+  .btn-ghost {
+    background: rgb(var(--raised));
+    border-color: rgb(var(--line));
+    color: rgb(var(--ink));
+  }
+  .btn-ghost:hover:not(:disabled) {
+    border-color: rgb(var(--accent) / 0.6);
+  }
+  .btn:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+  }
+
+  .panel {
+    background: rgb(var(--surface));
+    border: 1px solid rgb(var(--line));
+    border-radius: 0.875rem;
+  }
+
+  .term {
+    background: rgb(var(--term));
+    border: 1px solid rgb(var(--line));
+    border-radius: 0.875rem;
+    overflow: hidden;
+    box-shadow: 0 24px 60px -28px rgb(0 0 0 / 0.8), 0 0 0 1px rgb(var(--accent) / 0.04);
+  }
+
+  .eyebrow {
+    font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.75rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: rgb(var(--accent));
+  }
+
+  .caret::after {
+    content: '';
+    display: inline-block;
+    width: 0.55ch;
+    height: 1.05em;
+    margin-left: 2px;
+    vertical-align: -0.15em;
+    background: rgb(var(--accent));
+    animation: blink 1.1s steps(1) infinite;
+  }
+  @keyframes blink {
+    50% {
+      opacity: 0;
     }
   }
 }
