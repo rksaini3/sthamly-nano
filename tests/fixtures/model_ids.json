@@ -1,1 +1,106 @@
-
+[
+ {
+  "input": "Qwen/Qwen2.5-1.5B-Instruct",
+  "expected": "Qwen/Qwen2.5-1.5B-Instruct"
+ },
+ {
+  "input": "  Qwen/Qwen2.5-1.5B-Instruct \n",
+  "expected": "Qwen/Qwen2.5-1.5B-Instruct"
+ },
+ {
+  "input": "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct",
+  "expected": "Qwen/Qwen2.5-1.5B-Instruct"
+ },
+ {
+  "input": "huggingface.co/Qwen/Qwen2.5-1.5B-Instruct/",
+  "expected": "Qwen/Qwen2.5-1.5B-Instruct"
+ },
+ {
+  "input": "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct/tree/main",
+  "expected": "Qwen/Qwen2.5-1.5B-Instruct"
+ },
+ {
+  "input": "https://hf.co/Qwen/Qwen2.5-1.5B-Instruct?x=1#y",
+  "expected": "Qwen/Qwen2.5-1.5B-Instruct"
+ },
+ {
+  "input": "http://www.huggingface.co/a/b",
+  "expected": "a/b"
+ },
+ {
+  "input": "HTTPS://HuggingFace.co/A/B",
+  "expected": "A/B"
+ },
+ {
+  "input": "meta-llama/Llama-3.2-1B",
+  "expected": "meta-llama/Llama-3.2-1B"
+ },
+ {
+  "input": "Qwen",
+  "expected": null
+ },
+ {
+  "input": "",
+  "expected": null
+ },
+ {
+  "input": "   ",
+  "expected": null
+ },
+ {
+  "input": "a/b/c",
+  "expected": null
+ },
+ {
+  "input": "../etc/passwd",
+  "expected": null
+ },
+ {
+  "input": "a/..",
+  "expected": null
+ },
+ {
+  "input": "-a/b",
+  "expected": null
+ },
+ {
+  "input": "a/-b",
+  "expected": null
+ },
+ {
+  "input": "a b/c",
+  "expected": null
+ },
+ {
+  "input": "a/b\nc",
+  "expected": null
+ },
+ {
+  "input": "https://huggingface.co/datasets/a/b",
+  "expected": null
+ },
+ {
+  "input": "https://huggingface.co/spaces/a/b",
+  "expected": null
+ },
+ {
+  "input": "datasets/a",
+  "expected": null
+ },
+ {
+  "input": "https://huggingface.co/onlyone",
+  "expected": null
+ },
+ {
+  "input": "https://example.com/a/b",
+  "expected": null
+ },
+ {
+  "input": "a/b;drop table jobs",
+  "expected": null
+ },
+ {
+  "input": "a/b'--",
+  "expected": null
+ }
+]
