@@ -8,6 +8,7 @@ import ModelCard from '@/components/ModelCard'
 import Terminal from '@/components/Terminal'
 import { chartData } from '@/lib/chart'
 import { findings } from '@/lib/findings'
+import { safeLink } from '@/lib/jobs'
 import { domainName } from '@/lib/labels'
 import { LADDER, NOT_CLAIMED } from '@/lib/ladder'
 import { getModels } from '@/lib/supabase'
@@ -37,8 +38,9 @@ const HOW_TO_READ = [
 
 export default async function Home() {
   const { models, error } = await getModels()
-  const contact = process.env.NEXT_PUBLIC_CONTACT_URL
-  // The audit form works only when the Phase 1 backend (db/schema_v3.sql + worker) is switched on.
+  const contact = safeLink(process.env.NEXT_PUBLIC_CONTACT_URL)
+  // The audit really runs only when the Phase 1 backend (db/schema_v3.sql + scripts/worker.py) is switched on.
+  // The input box is typeable either way; without the flag the form just says the audit is not live yet.
   const auditOn = process.env.NEXT_PUBLIC_AUDIT_ENABLED === '1'
 
   // The chart shows the first model that has at least two quants measured.
@@ -47,9 +49,10 @@ export default async function Home() {
   // Only gains that are CLEAR (more than 2x the error) are quoted: no hardcoded percentages.
   const results = hero?.results ?? null
   const clearGains = results
-    ? Object.entries(kldReductionPct(results)).filter(
-        ([d, g]) => g > 0 && compare(results[d].hindi60, results[d].standard).verdict === 'clear'
-      )
+    ? Object.entries(kldReductionPct(results)).filter(([d, g]) => {
+        const set = results[d]
+        return g > 0 && Boolean(set?.hindi60 && set?.standard) && compare(set.hindi60, set.standard).verdict === 'clear'
+      })
     : []
 
   // With a load error and no data there is nothing to chart: the ErrorNote already says so.
@@ -85,11 +88,11 @@ export default async function Home() {
         <div id="audit">
           <Terminal title="sthamly · free hindi audit">
             <AuditForm
-              disabled={!auditOn}
+              enabled={auditOn}
               note={
                 auditOn ? undefined : (
                   <>
-                    Free audit abhi chalu nahi hua.{' '}
+                    Free audit abhi chalu nahi hua. Model ID likh kar check kar sakte ho.{' '}
                     {contact ? (
                       <a className="text-accent underline underline-offset-2" href={contact}>
                         Pehle audit ke liye contact karo
@@ -162,11 +165,11 @@ export default async function Home() {
                   <div className="mt-auto space-y-3 pt-6">
                     {contact ? (
                       <a href={contact} className="btn btn-primary w-full">
-                        ⚡ Calibrate & Quantize: Rs 399
+                        ⚡ Calibrate &amp; Quantize: ₹399
                       </a>
                     ) : (
                       <button type="button" className="btn btn-primary w-full" disabled>
-                        ⚡ Calibrate & Quantize: Rs 399
+                        ⚡ Calibrate &amp; Quantize: ₹399
                       </button>
                     )}
                     <p className="text-xs text-muted">Abhi manual UPI se. Self-serve payment baad me aayega.</p>
@@ -237,10 +240,10 @@ export default async function Home() {
       <section className="mt-16" aria-labelledby="offer-title">
         <h2 id="offer-title" className="font-display text-2xl font-bold tracking-tight">Aap kya le sakte ho</h2>
         <p className="mb-6 mt-2 max-w-2xl text-muted">Shuru me aapko kuch badalna nahi. Pehle sirf ek report.</p>
-        <ol className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-          {LADDER.map((s, i) => (
+        <ol className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+          {LADDER.map((s) => (
             <li key={s.name} className="panel flex flex-col p-5">
-              <span className="font-mono text-xs text-accent">0{i + 1}</span>
+              <span className="font-mono text-xs text-accent">{s.step}</span>
               <h3 className="mt-1 font-semibold">{s.name}</h3>
               <p className="mt-2 text-sm text-muted">{s.what}</p>
               {s.note && <p className="mt-2 text-xs text-muted">{s.note}</p>}
