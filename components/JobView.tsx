@@ -5,7 +5,7 @@ import { useEffect, useState } from 'react'
 import { AuditResultView, CalibrateResultView } from '@/components/JobResult'
 import Terminal from '@/components/Terminal'
 import { fetchJob } from '@/lib/jobs-api'
-import { isTerminal, jobErrorMessage, type JobData, type JobStatus, type StepState } from '@/lib/jobs'
+import { isTerminal, jobErrorMessage, safeLink, type JobData, type JobStatus, type StepState } from '@/lib/jobs'
 
 const POLL_MS = 3000
 const RETRY_MS = 8000
@@ -31,10 +31,10 @@ const STEP_MARK: Record<StepState, { mark: string; text: string; cls: string }> 
   done: { mark: '✓', text: 'ho gaya', cls: 'text-good' },
   running: { mark: '⚙', text: 'chal raha hai', cls: 'text-ink' },
   failed: { mark: '✕', text: 'fail', cls: 'text-bad' },
-  pending: { mark: '\u00a0', text: 'baaki', cls: 'text-muted' },
+  pending: { mark: ' ', text: 'baaki', cls: 'text-muted' },
 }
 
-/** Everything a visitor sees for one job. Pure (no fetching), so it can be rendered in tests. */
+/** Everything a visitor sees for one job. Pure (no fetching), so it can be rendered in tests and screenshots. */
 export function JobBody({ job, netError, contact }: { job: JobData; netError: string | null; contact?: string }) {
   const active = job.status === 'queued' || job.status === 'running'
 
@@ -68,7 +68,7 @@ export function JobBody({ job, netError, contact }: { job: JobData; netError: st
             {job.steps.map((s) => {
               const m = STEP_MARK[s.state]
               return (
-                <li key={s.id} className={`flex gap-3 ${m.cls}`}>
+                <li key={s.label} className={`flex gap-3 ${m.cls}`}>
                   <span aria-hidden className="shrink-0 whitespace-pre">[{m.mark}]</span>
                   <span>
                     {s.label}
@@ -117,7 +117,7 @@ export function JobBody({ job, netError, contact }: { job: JobData; netError: st
   )
 }
 
-/** Live view of one job: polls get_job every 3 seconds until the job reaches a final state. */
+/** Live view of one job: asks get_job every 3 seconds until the job reaches a final state. */
 export default function JobView({ id }: { id: string }) {
   const [job, setJob] = useState<JobData | null | undefined>(undefined) // undefined = still loading
   const [netError, setNetError] = useState<string | null>(null)
@@ -176,5 +176,5 @@ export default function JobView({ id }: { id: string }) {
     )
   }
 
-  return <JobBody job={job} netError={netError} contact={process.env.NEXT_PUBLIC_CONTACT_URL} />
+  return <JobBody job={job} netError={netError} contact={safeLink(process.env.NEXT_PUBLIC_CONTACT_URL)} />
 }
