@@ -9,11 +9,13 @@ const r: Results = {
     standard: { kld: [0.0642, 0.003], rms: [9.91, 0.39], top: [87.48, 0.6] },
     hindi60: { kld: [0.0509, 0.0018], rms: [8.41, 0.28], top: [88.95, 0.57] },
     english60: { kld: [0.0545, 0.0019], rms: [9.06, 0.31], top: [88.43, 0.58] },
+    mixed60: { kld: [0.0498, 0.0018], rms: [8.31, 0.28], top: [88.79, 0.57] },
   },
   sangraha: {
     standard: { kld: [0.0635, 0.0019], rms: [9.27, 0.28], top: [85.39, 0.64] },
     hindi60: { kld: [0.0573, 0.0024], rms: [8.9, 0.33], top: [86.08, 0.63] },
     english60: { kld: [0.0627, 0.0023], rms: [9.39, 0.35], top: [85.75, 0.63] },
+    mixed60: { kld: [0.0586, 0.0019], rms: [8.88, 0.3], top: [85.78, 0.63] },
   },
 }
 
@@ -53,30 +55,31 @@ test('kldReductionPct tolerates missing results', () => {
   assert.deepEqual(kldReductionPct(null), {})
 })
 
-test('variantLabel prefers custom label, then known label, then the key', () => {
+test('variantLabel falls back to the raw key for custom (audit) labels', () => {
   assert.equal(variantLabel('hindi60'), 'Hindi imatrix')
-  assert.equal(variantLabel('x', { x: { label: 'My quant' } }), 'My quant')
-  assert.equal(variantLabel('unknown'), 'unknown')
+  assert.equal(variantLabel('bartowski-Q4_K_M'), 'bartowski-Q4_K_M')
 })
 
-test('orderedVariants: known order first, others A-Z', () => {
-  const v = r.wiki
-  const extra = { ...v, zeta: v.standard, alpha: v.standard }
-  assert.deepEqual(orderedVariants(extra), ['standard', 'hindi60', 'english60', 'alpha', 'zeta'])
+test('orderedVariants puts known variants first, custom ones after', () => {
+  assert.deepEqual(orderedVariants({ zzz: 1, mixed60: 1, standard: 1, aaa: 1 }), ['standard', 'mixed60', 'zzz', 'aaa'])
 })
 
-test('leaderboardRows ranks by mean KLD and says who is clearly behind the best', () => {
-  const rows = leaderboardRows({ results: r, variants_meta: { hindi60: { size_gb: 1.12 } } })
-  assert.deepEqual(rows.map((x) => x.variant), ['hindi60', 'english60', 'standard'])
-  assert.ok(rows[0].isBest && rows[0].behindBest === 0)
-  assert.equal(rows[0].sizeGb, 1.12)
-  const std = rows.find((x) => x.variant === 'standard')!
-  assert.equal(std.behindBest, 2) // plain Q4 is clearly behind the best on both test sets
-  assert.equal(std.domains, 2)
+test('leaderboard ranks by mean KLD and counts clear separation per test set', () => {
+  const rows = leaderboardRows({ results: r, variants_meta: { standard: { size_gb: 1.12 } } })
+  assert.deepEqual(rows.map((x) => x.variant), ['hindi60', 'mixed60', 'english60', 'standard'])
+  const by = Object.fromEntries(rows.map((x) => [x.variant, x]))
+  assert.equal(by.hindi60.isBest, true)
+  assert.equal(by.standard.behindBest, 2) // clearly behind the best on both test sets
+  assert.equal(by.english60.behindBest, 0) // not clearly behind: the honest "Hindi vs English" result
+  assert.equal(by.mixed60.behindBest, 0)
+  assert.equal(by.standard.sizeGb, 1.12)
+  assert.equal(by.hindi60.sizeGb, null)
+  assert.ok(Math.abs(by.hindi60.kld - 0.0541) < 1e-9)
 })
 
-test('leaderboardRows ignores quants that are not measured on every test set', () => {
-  const partial = { wiki: r.wiki, sangraha: { standard: r.sangraha.standard } }
+test('leaderboard ignores variants that are missing on some test set, and empty results', () => {
+  const partial: Results = { wiki: { ...r.wiki }, sangraha: { standard: r.sangraha.standard } }
   assert.deepEqual(leaderboardRows({ results: partial, variants_meta: null }).map((x) => x.variant), ['standard'])
   assert.deepEqual(leaderboardRows({ results: null, variants_meta: null }), [])
+  assert.deepEqual(leaderboardRows({ results: {}, variants_meta: null }), [])
 })
