@@ -1,10 +1,13 @@
 import { createClient, type SupabaseClient } from '@supabase/supabase-js'
 import type { Model } from '@/lib/types'
 
-// Public client: uses the anon key, so it is safe in the browser. The anon role can only
-// SELECT from `models` and call the three public RPC functions (db/schema.sql, db/schema_v3.sql).
+// Public client: uses the anon key, so it is safe in the browser. It can only SELECT from `models`
+// and call the three public functions (create_audit_job, get_job, activate_license) from db/schema_v3.sql.
 // The service-role key is never used here and must never be put in a NEXT_PUBLIC_ variable.
 let client: SupabaseClient | null = null
+
+export const NOT_CONFIGURED =
+  'Supabase configure nahi hai (NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY).'
 
 export function getClient(): SupabaseClient | null {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL
@@ -13,9 +16,6 @@ export function getClient(): SupabaseClient | null {
   client ??= createClient(url, key)
   return client
 }
-
-export const NOT_CONFIGURED =
-  'Supabase configure nahi hai (NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY).'
 
 /** Never throws: pages show `error` instead of crashing (or silently showing "no models"). */
 export async function getModels(): Promise<{ models: Model[]; error: string | null }> {
