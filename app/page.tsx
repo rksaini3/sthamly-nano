@@ -88,7 +88,7 @@ export default async function Home() {
         <div id="audit">
           <Terminal title="sthamly · free hindi audit">
             <AuditForm
-              enabled={auditOn}
+              disabled={!auditOn}
               note={
                 auditOn ? undefined : (
                   <>
