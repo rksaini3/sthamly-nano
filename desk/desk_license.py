@@ -1,4 +1,4 @@
-"""Activation key: Supabase ke activate_license() se jaanch, aur local cache (offline bhi kuch din chalta hai).
+"""Activation key: Supabase ke verify_client_activation() se jaanch, aur local cache (offline bhi kuch din chalta hai).
 
 Server (db/schema_v3.sql) key ka sirf hash rakhta hai aur device limit (default 2) lagata hai.
 Yahan sirf PUBLIC anon key chalti hai. service_role key is software me kabhi nahi hoti.
@@ -23,7 +23,7 @@ RECHECK_DAYS = 7   # itne din baad server se dobara poochte hain
 GRACE_DAYS = 14    # internet na ho to itne din tak purani jaanch maani jaati hai
 
 MESSAGES = {
-    "invalid_key": "Key galat hai. Dobara dekho (jaise STH-ABCD-EFGH-IJKL-MNOP).",
+    "invalid_key": "Key galat hai. Dobara dekho (jaise STH-ABCD-EFGH-IJKL).",
     "revoked": "Ye key band kar di gayi hai. Jisne di hai unse baat karo.",
     "device_limit": "Is key par device ki limit poori ho chuki hai. Jisne di hai unse baat karo.",
     "rate_limited": "Bahut zyada galat koshishein hui hain. Thodi der baad dobara try karo.",
@@ -39,11 +39,23 @@ def device_id() -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
+def get_os_platform() -> str:
+    """Detects running operating system mapping for hardware tracking logs."""
+    sys_name = platform.system().lower()
+    if "windows" in sys_name:
+        return "windows"
+    if "darwin" in sys_name:
+        return "macos"
+    return "linux"
+
+
 def rpc(cfg: dict[str, Any], fn: str, payload: dict[str, Any], timeout: float = 15.0) -> Any:
     url = str(cfg.get("supabase_url") or "").rstrip("/")
     key = str(cfg.get("supabase_anon_key") or "")
     if not url or not key:
         raise DeskError("not_configured", "Is software me server ka pata (Supabase) set nahi hai. desk_config.json dekho.", 500)
+    
+    # Secure edge routing matrix mapping directly to RPC standard interfaces
     req = urllib.request.Request(f"{url}/rest/v1/rpc/{fn}", data=json.dumps(payload).encode("utf-8"), method="POST",
                                  headers={"apikey": key, "Authorization": f"Bearer {key}", "Content-Type": "application/json"})
     try:
@@ -58,7 +70,15 @@ def rpc(cfg: dict[str, Any], fn: str, payload: dict[str, Any], timeout: float = 
 
 
 def public(data: dict[str, Any]) -> dict[str, Any]:
-    return {k: data.get(k) for k in ("profile", "label", "actions", "disclaimer")}
+    # Support system_prompt payload delivery down to the application lifecycle layer
+    payload_box = data.get("payload") or {}
+    return {
+        "profile": data.get("profile"),
+        "label": data.get("label") or f"Sthamly {str(data.get('profile')).capitalize()} Desk",
+        "actions": data.get("actions") or [],
+        "disclaimer": data.get("disclaimer") or "100% Private Offline Workspace footprint.",
+        "system_prompt": payload_box.get("system_prompt")
+    }
 
 
 class LicenseStore:
@@ -88,10 +108,28 @@ class LicenseStore:
         key = (key or "").strip()
         if not key:
             raise DeskError("empty", "Pehle key likho.")
-        r = rpc(self.cfg, "activate_license", {"p_key": key, "p_device": device_id()})
-        if not isinstance(r, dict) or not r.get("ok"):
-            code = r.get("error", "invalid_key") if isinstance(r, dict) else "invalid_key"
-            raise DeskError(code, MESSAGES.get(code, "Key chal nahi saki."), 403)
+            
+        # --- FIXED RPC ROUTING ARGUMENTS MATRIX ---
+        # Parameters aligned perfectly with verify_client_activation database specs
+        payload = {
+            "p_license_key": key,
+            "p_hardware_fingerprint": device_id(),
+            "p_client_os": get_os_platform()
+        }
+        
+        r = rpc(self.cfg, "verify_client_activation", payload)
+        
+        if not isinstance(r, dict) or not r.get("success"):
+            code = r.get("message", "invalid_key") if isinstance(r, dict) else "invalid_key"
+            # Fallback error notes parsing safely
+            err_msg = MESSAGES.get("invalid_key")
+            if isinstance(r, dict) and "deactivated" in str(r.get("message")).lower():
+                err_msg = MESSAGES.get("revoked")
+            elif isinstance(r, dict) and "limit" in str(r.get("message")).lower():
+                err_msg = MESSAGES.get("device_limit")
+                
+            raise DeskError("invalid_key", err_msg, 403)
+            
         data = {**public(r), "key": key, "checked_at": time.time()}
         self._save(data)
         return public(data)
@@ -105,14 +143,20 @@ class LicenseStore:
             return None
         age = (time.time() - float(data.get("checked_at", 0))) / 86400
         if age > RECHECK_DAYS:
+            payload = {
+                "p_license_key": data["key"],
+                "p_hardware_fingerprint": device_id(),
+                "p_client_os": get_os_platform()
+            }
             try:
-                r = rpc(self.cfg, "activate_license", {"p_key": data["key"], "p_device": device_id()})
+                r = rpc(self.cfg, "verify_client_activation", payload)
             except DeskError:
                 return public(data) if age <= GRACE_DAYS else None
-            if isinstance(r, dict) and r.get("ok"):
+                
+            if isinstance(r, dict) and r.get("success"):
                 data = {**data, **public(r), "checked_at": time.time()}
                 self._save(data)
-            elif isinstance(r, dict) and r.get("error") in ("revoked", "invalid_key"):
+            elif isinstance(r, dict) and not r.get("success"):
                 self.clear()
                 return None
             elif age > GRACE_DAYS:
