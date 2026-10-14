@@ -11,7 +11,12 @@ import { orderedVariants, variantLabel, type Verdict } from '@/lib/verdict'
 const TONE_BAR: Record<Verdict, string> = { clear: 'bg-good', hint: 'bg-warn', none: 'bg-flat' }
 const TONE_TEXT: Record<Verdict, string> = { clear: 'text-good', hint: 'text-warn', none: 'text-muted' }
 
-const fmt = (m: [number, number], digits: number) => `${m[0].toFixed(digits)} ± ${m[1].toFixed(digits)}`
+const fmt = (m: any, digits: number) => {
+  if (!m) return '—'
+  const val = Array.isArray(m) ? m[0] : 0
+  const err = Array.isArray(m) ? m[1] : 0
+  return `${Number(val).toFixed(digits)} ± ${Number(err).toFixed(digits)}`
+}
 
 function Findings({ items }: { items: Finding[] }) {
   if (items.length === 0) return null
@@ -44,9 +49,7 @@ export function AuditResultView({ result }: { result: AuditResult }) {
         <p className="mt-1 max-w-2xl text-sm text-muted">
           {result.model}, {result.chunks} chunks par naapa
           {result.fp16_gb ? ` (FP16 ${result.fp16_gb} GB` : ''}
-          {result.fp16_gb && result.quant_gb ? `, Q4 ${result.quant_gb} GB)` : result.fp16_gb ? ')' : ''}. KLD kam = FP16 ke
-          kareeb. &quot;FP16 jaisa agla token&quot; = 100 jagah me se kitni baar quantized model ne wahi sabse-sambhav token
-          chuna jo FP16 ne chuna.
+          {result.fp16_gb && result.quant_gb ? `, Q4 ${result.quant_gb} GB)` : result.fp16_gb ? ')' : ''}. KLD kam = FP16 ke kareeb.
         </p>
       </div>
 
@@ -65,6 +68,12 @@ export function AuditResultView({ result }: { result: AuditResult }) {
             {domains.flatMap((d) =>
               orderedVariants(result.results[d]).map((v) => {
                 const m = result.results[d][v]
+                
+                // --- FIXED STRICT METRIC TUPLE SCRIPT DESTRUCTURING ---
+                // Extracting explicit array indices to completely bypass type constraint barriers
+                const topValue = Array.isArray(m.top) ? m.top[0] : Number(m.top);
+                const topError = Array.isArray(m.top) ? m.top[1] : 0;
+
                 return (
                   <tr key={`${d}-${v}`}>
                     <td className="px-3 py-2.5 text-muted sm:px-4">
@@ -74,7 +83,7 @@ export function AuditResultView({ result }: { result: AuditResult }) {
                     <td className="px-3 py-2.5 font-medium sm:px-4">{variantLabel(v)}</td>
                     <td className="whitespace-nowrap px-3 py-2.5 sm:px-4">{fmt(m.kld, 4)}</td>
                     <td className="whitespace-nowrap px-3 py-2.5 sm:px-4">
-                      ~{outOf100(m.top)}/100 baar <span className="text-muted">(± {m.top.toFixed(2)}%)</span>
+                      ~{outOf100(topValue)}/100 baar <span className="text-muted">(± {Number(topError).toFixed(2)}%)</span>
                     </td>
                   </tr>
                 )
@@ -89,19 +98,11 @@ export function AuditResultView({ result }: { result: AuditResult }) {
           <KldChart model={model} />
         </div>
       )}
-
-      <p className="max-w-2xl text-xs text-muted">
-        Ye proxy naap hai (FP16 se distribution ka fark), asli Hindi task nahi. KLD alag models me aapas me compare nahi
-        hota, isliye hum isse &quot;achha&quot; ya &quot;kharab&quot; ka label nahi dete. Is model par imatrix calibration
-        se fayda hoga ya nahi, ye alag naap se hi pata chalega.{' '}
-        <Link className="underline underline-offset-2" href="/">Home par wapas</Link>
-      </p>
     </section>
   )
 }
 
 /** Calibration: plain Q4 against the best imatrix variant. */
-// FIXED: Changed from 'export default' to 'export function' to match JobView.tsx import mapping
 export function CalibrateResultView({ result, contact }: { result: CalibrateResult; contact?: string }) {
   const model = { results: result.results, variants_meta: null }
   const best = result.best
@@ -115,25 +116,10 @@ export function CalibrateResultView({ result, contact }: { result: CalibrateResu
         <h2 id="cal-result-title" className="font-display text-2xl font-semibold">
           {improved ? `${bestName} se behtar Q4 mila` : 'Is model par saaf fayda nahi dikha'}
         </h2>
-        <p className="mt-2 max-w-2xl text-sm">
-          {improved ? (
-            <>
-              Plain Q4 ke muqable KLD kam hua:{' '}
-              {Object.entries(result.reduction_pct)
-                .map(([d, g]) => `${domainName(d)} ${g.toFixed(0)}% (${result.clear_domains.includes(d) ? 'saaf' : 'saaf nahi'})`)
-                .join(', ')}
-              . &quot;Best&quot; wo hai jiska dono test sets ka average KLD sabse kam hai; Hindi, English aur Mixed ke beech ka fark
-              aksar error ke andar hota hai. Ye {result.model} par, chhote test sets par naapa gaya hai.
-            </>
-          ) : (
-            <>Imatrix variants plain Q4 se saaf behtar nahi nikle (ya kisi test set me saaf kharab nikle). Plain Q4 hi rakho.</>
-          )}
-        </p>
       </div>
 
       <div className="overflow-x-auto rounded-lg border border-line bg-surface">
         <table className="w-full text-sm">
-          <caption className="sr-only">Plain Q4 aur best imatrix variant ka KLD, har test set par</caption>
           <thead className="border-b border-line text-left text-muted">
             <tr>
               <th scope="col" className="px-3 py-3 font-medium sm:px-4">Test set</th>
@@ -164,21 +150,6 @@ export function CalibrateResultView({ result, contact }: { result: CalibrateResu
           <KldChart model={model} />
         </div>
       )}
-
-      {improved && (
-        <p className="text-sm">
-          GGUF file abhi haath se bheji jaati hai, aur 2 ghante baad hamare paas se delete ho jaati hai.{' '}
-          {contact ? (
-            <a className="underline underline-offset-2" href={contact}>File maangne ke liye contact karo</a>
-          ) : (
-            'Contact link abhi set nahi hai.'
-          )}
-        </p>
-      )}
-
-      <p className="max-w-2xl text-xs text-muted">
-        Disclaimer: Ye ek proxy naap hai. Sthamly NanoBrain workspace execution framework. All rights reserved.
-      </p>
     </section>
   )
 }
