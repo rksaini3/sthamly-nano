@@ -63,8 +63,16 @@ function render(){
     row.append(t,x);box.appendChild(row);});
   const a=$('#actions');a.textContent='';
   (lic.actions||[]).forEach(label=>{const b=document.createElement('button');b.textContent=label;
-    b.onclick=()=>label.toLowerCase().includes('upload')?$('#file').click():ask('',label);a.appendChild(b);});
+    b.onclick=()=>label.toLowerCase().includes('upload')?$('#file').click():handleActionClick(label);a.appendChild(b);});
 }
+
+function handleActionClick(actionLabel){
+  // Captures the custom query context from textarea instead of wiping it blank
+  const currentMsg=$('#q').value.trim();
+  $('#q').value='';
+  ask(currentMsg,actionLabel);
+}
+
 function bubble(cls,text){const m=document.createElement('div');m.className='msg '+cls;m.textContent=text;const log=$('#log');
   if(log.firstElementChild&&log.firstElementChild.classList.contains('muted'))log.textContent='';log.appendChild(m);log.scrollTop=log.scrollHeight;return m;}
 async function ask(message,action){
@@ -84,7 +92,12 @@ $('#q').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('#se
 $('#up').onclick=()=>$('#file').click();
 $('#file').onchange=async e=>{$('#uperr').textContent='';
   for(const f of e.target.files){
-    const data=await new Promise(res=>{const r=new FileReader();r.onload=()=>res(String(r.result).split(',')[1]||'');r.readAsDataURL(f);});
+    // SAFE FILE READER PATCH: Find the first comma index instead of split array matrix slicing
+    const data=await new Promise(res=>{const r=new FileReader();r.onload=()=> {
+      const s = String(r.result);
+      const idx = s.indexOf(',');
+      res(idx !== -1 ? s.substring(idx + 1) : '');
+    };r.readAsDataURL(f);});
     try{await api('/api/upload',{name:f.name,data});}catch(err){$('#uperr').textContent=f.name+': '+err.message;}}
   e.target.value='';load();};
 $('#go').onclick=async()=>{$('#lockerr').textContent='';
