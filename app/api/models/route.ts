@@ -57,7 +57,7 @@ export async function POST(req: NextRequest) {
     }
 
     // नया बना हुआ जॉब डेटा वापस फ्रंटेंड को भेजें (201 Created)
-    return NextResponse.json(data[0], { status: 201 })
+    return NextResponse.json(data[0] || data, { status: 201 })
 
   } catch (err) {
     return NextResponse.json({ error: 'रिक्वेस्ट का JSON फॉर्मेट या डेटा सही नहीं है।' }, { status: 400 })
