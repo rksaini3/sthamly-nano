@@ -36,10 +36,15 @@ export default function ComparisonTable({ models }: { models: Model[] | null }) 
         const domains = Object.keys(results)
         // Pairs are only shown when at least one test set has both sides (imatrix experiment rows).
         const pairs = PAIRS.filter(([a, b]) => domains.some((d) => results[d][a] && results[d][b]))
+        
+        // --- FIXED DATA BINDING MATRIX KEY ---
+        // Dynamically falls back onto hf_model_identifier if model_name is missing from the payload
+        const displayModelName = m.hf_model_identifier || (m as any).model_name || "Unknown Model";
+
         return (
           <article key={m.id} aria-labelledby={`b-${m.id}`}>
             <h2 id={`b-${m.id}`} className="font-display text-2xl font-semibold mb-6">
-              {m.model_name}
+              {displayModelName}
             </h2>
 
             {pairs.length > 0 && (
@@ -93,7 +98,7 @@ export default function ComparisonTable({ models }: { models: Model[] | null }) 
               <h3 className="font-display font-semibold text-lg mb-3">Poore numbers</h3>
               <div className="overflow-x-auto rounded-lg border border-line bg-surface">
                 <table className="w-full text-sm">
-                  <caption className="sr-only">{m.model_name}: har test set par har variant ka KLD aur same top-p</caption>
+                  <caption className="sr-only">{displayModelName}: har test set par har variant ka KLD aur same top-p</caption>
                   <thead className="text-left text-muted border-b border-line">
                     <tr>
                       <th scope="col" className="px-3 sm:px-4 py-3 font-medium">Test set</th>
@@ -106,7 +111,7 @@ export default function ComparisonTable({ models }: { models: Model[] | null }) 
                     {domains.flatMap((d) =>
                       orderedVariants(results[d]).map((v) => (
                         <tr key={`${d}-${v}`}>
-                          <td className="px-3 sm:px-4 py-2.5 text-muted">{d}</td>
+                          <td className="px-3 sm:px-4 py-2.5 text-muted">{domainName(d)}</td>
                           <td className="px-3 sm:px-4 py-2.5 font-medium">{variantLabel(v)}</td>
                           <td className="px-3 sm:px-4 py-2.5 whitespace-nowrap">{fmt(results[d][v].kld, 4)}</td>
                           <td className="px-3 sm:px-4 py-2.5 whitespace-nowrap">{fmt(results[d][v].top, 2)}</td>
