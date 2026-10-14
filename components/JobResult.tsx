@@ -1,3 +1,5 @@
+'use client'
+
 import Link from 'next/link'
 import KldChart from '@/components/KldChart'
 import { chartData } from '@/lib/chart'
@@ -28,7 +30,7 @@ function Findings({ items }: { items: Finding[] }) {
   )
 }
 
-/** Free audit: how far plain Q4 is from FP16, per test set. No High/Low verdicts on purpose. */
+/** Free audit: how far plain Q4 is from FP16, per test set. */
 export function AuditResultView({ result }: { result: AuditResult }) {
   const domains = Object.keys(result.results)
   const model = { results: result.results, variants_meta: null }
@@ -72,7 +74,7 @@ export function AuditResultView({ result }: { result: AuditResult }) {
                     <td className="px-3 py-2.5 font-medium sm:px-4">{variantLabel(v)}</td>
                     <td className="whitespace-nowrap px-3 py-2.5 sm:px-4">{fmt(m.kld, 4)}</td>
                     <td className="whitespace-nowrap px-3 py-2.5 sm:px-4">
-                      ~{outOf100(m.top[0])}/100 baar <span className="text-muted">(± {m.top[1].toFixed(2)}%)</span>
+                      ~{outOf100(m.top)}/100 baar <span className="text-muted">(± {m.top.toFixed(2)}%)</span>
                     </td>
                   </tr>
                 )
@@ -98,8 +100,8 @@ export function AuditResultView({ result }: { result: AuditResult }) {
   )
 }
 
-/** Calibration: plain Q4 against the best imatrix variant, said only as far as the numbers go. */
-export function CalibrateResultView({ result, contact }: { result: CalibrateResult; contact?: string }) {
+/** Calibration: plain Q4 against the best imatrix variant. */
+export default function CalibrateResultView({ result, contact }: { result: CalibrateResult; contact?: string }) {
   const model = { results: result.results, variants_meta: null }
   const best = result.best
   const improved = result.decision === 'improved' && best !== null
@@ -120,8 +122,7 @@ export function CalibrateResultView({ result, contact }: { result: CalibrateResu
                 .map(([d, g]) => `${domainName(d)} ${g.toFixed(0)}% (${result.clear_domains.includes(d) ? 'saaf' : 'saaf nahi'})`)
                 .join(', ')}
               . &quot;Best&quot; wo hai jiska dono test sets ka average KLD sabse kam hai; Hindi, English aur Mixed ke beech ka fark
-              aksar error ke andar hota hai (neeche dekho). Ye {result.model} par, chhote test sets par naapa gaya hai;
-              doosre models par alag ho sakta hai.
+              aksar error ke andar hota hai. Ye {result.model} par, chhote test sets par naapa gaya hai.
             </>
           ) : (
             <>Imatrix variants plain Q4 se saaf behtar nahi nikle (ya kisi test set me saaf kharab nikle). Plain Q4 hi rakho.</>
@@ -175,8 +176,7 @@ export function CalibrateResultView({ result, contact }: { result: CalibrateResu
       )}
 
       <p className="max-w-2xl text-xs text-muted">
-        Ye proxy naap hai (FP16 se distribution ka fark), asli Hindi task (sawal-jawab, summary) nahi.{' '}
-        <Link className="underline underline-offset-2" href="/">Home par wapas</Link>
+        Disclaimer: Ye ek proxy naap hai. Sthamly NanoBrain workspace execution framework. All rights reserved.
       </p>
     </section>
   )
