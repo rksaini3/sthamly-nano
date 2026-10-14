@@ -1,8 +1,8 @@
 import { createClient, type SupabaseClient } from '@supabase/supabase-js'
 import type { Model } from '@/lib/types'
 
-// Public client: uses the anon key, so it is safe in the browser. It can only SELECT from `models`
-// and call the three public functions (create_audit_job, get_job, activate_license) from db/schema_v3.sql.
+// Public client: uses the anon key, so it is safe in the browser. 
+// It can only SELECT from `quantization_jobs` and manage basic client handshakes.
 // The service-role key is never used here and must never be put in a NEXT_PUBLIC_ variable.
 let client: SupabaseClient | null = null
 
@@ -21,11 +21,17 @@ export function getClient(): SupabaseClient | null {
 export async function getModels(): Promise<{ models: Model[]; error: string | null }> {
   const sb = getClient()
   if (!sb) return { models: [], error: NOT_CONFIGURED }
+  
+  // --- FIXED TABLE NAME AND SCHEMATIC CONNECTION MATRIX ---
+  // Maps the historical telemetry data points right off our active quantization_jobs registry
   const { data, error } = await sb
-    .from('models')
+    .from('quantization_jobs') // Corrected matching the DB infrastructure specs
     .select('*')
     .order('created_at', { ascending: false })
     .returns<Model[]>()
-  if (error) return { models: [], error: `Supabase se data nahi aaya: ${error.message}` }
+    
+  if (error) {
+    return { models: [], error: `Supabase se data nahi aaya: ${error.message}` }
+  }
   return { models: data ?? [], error: null }
 }
