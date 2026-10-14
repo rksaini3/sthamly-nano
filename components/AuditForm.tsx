@@ -2,14 +2,10 @@
 
 import { useRouter } from 'next/navigation'
 import { useState, type FormEvent, type ReactNode } from 'react'
-import { createAuditJob } from '@/lib/jobs-api'
-import { createErrorMessage } from '@/lib/jobs'
-import { NOT_CONFIGURED } from '@/lib/supabase'
 
 /**
  * Free audit entry: one Hugging Face model id in, a job page out. Errors are shown in plain Hindi.
- * With `disabled` the same form is shown switched off (with `note` explaining why), so the page layout
- * does not change when the audit backend is turned on.
+ * Updated to bypass abstract libraries and talk directly to our public API infrastructure route.
  */
 export default function AuditForm({ disabled = false, note }: { disabled?: boolean; note?: ReactNode }) {
   const router = useRouter()
@@ -19,20 +15,42 @@ export default function AuditForm({ disabled = false, note }: { disabled?: boole
 
   async function onSubmit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault()
-    if (busy || disabled) return
+    if (busy || disabled || value.trim() === '') return
+    
     setBusy(true)
     setError(null)
+
     try {
-      const r = await createAuditJob(value)
-      if (r.ok) {
-        router.push(`/job/${r.id}`) // stay "busy" while the page changes
-        return
+      // Direct unified fetch handshake mapping perfectly to the active backend schema
+      const response = await fetch('/api/models', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          hf_model_identifier: value.trim() // Correct DB schema mapping target
+        })
+      })
+
+      const data = await response.json()
+
+      if (response.ok) {
+        // Handle database array structure returned from your updated route.ts
+        const jobInstance = Array.isArray(data) ? data[0] : data
+        if (jobInstance && jobInstance.id) {
+          router.push(`/job/${jobInstance.id}`)
+          return
+        }
       }
-      setError(r.code === 'not_configured' ? NOT_CONFIGURED : createErrorMessage(r.code))
-    } catch {
-      setError(createErrorMessage('unknown'))
+
+      // Readable fallback translation matrix for errors
+      setError(data.error || 'Server ne naap asweekar kiya. Kripya thodi der baad koshish karein.')
+
+    } catch (err) {
+      setError('Network connection kamzor hai ya server offline hai. Kripya check karein.')
+    } finally {
+      setBusy(false)
     }
-    setBusy(false)
   }
 
   return (
@@ -41,7 +59,7 @@ export default function AuditForm({ disabled = false, note }: { disabled?: boole
         Public Hugging Face model ID
       </label>
       <p className="mt-3 font-mono text-sm text-accent" aria-hidden>
-        <span className="text-muted">$</span> sthamly audit --model
+        <span className="text-muted">\$</span> sthamly audit --model
       </p>
       <input
         id="audit-model"
@@ -51,7 +69,7 @@ export default function AuditForm({ disabled = false, note }: { disabled?: boole
         autoComplete="off"
         autoCapitalize="off"
         spellCheck={false}
-        disabled={disabled}
+        disabled={disabled || busy}
         value={value}
         onChange={(e) => setValue(e.target.value)}
         placeholder="Qwen/Qwen2.5-1.5B-Instruct"
@@ -67,8 +85,8 @@ export default function AuditForm({ disabled = false, note }: { disabled?: boole
           'owner/model-name likho ya Hugging Face ka link paste karo. Sirf public safetensors models (weights lagbhag 4 GB tak). Din me 3 audit.'}
       </p>
       {error && (
-        <p id="audit-error" role="alert" className="mt-3 text-sm text-bad">
-          {error}
+        <p id="audit-error" role="alert" className="mt-3 text-sm text-bad text-red-500">
+          ⚠️ {error}
         </p>
       )}
     </form>
