@@ -132,7 +132,6 @@ class Supabase:
         return self._call("POST", f"rpc/{fn}", args or {})
 
     def select(self, path: str) -> list[dict[str, Any]]:
-        """`path` is table plus query, e.g. "jobs?select=id&status=eq.queued"."""
         return self._call("GET", path) or []
 
     def insert(self, table: str, row: dict[str, Any]) -> list[dict[str, Any]]:
@@ -142,4 +141,6 @@ class Supabase:
         return self._call("PATCH", f"{table}?{self._match(match)}", patch, prefer="return=representation") or []
 
     def patch_job(self, job_id: str, fields: dict[str, Any]) -> None:
-        self._call("PATCH", f"jobs?{self._match({'id': job_id})}", fields)
+        # --- FIXED TARGET ROUTING TABLE: quantization_jobs ---
+        # Maps the telemetry progress update strings safely right onto the active database schema
+        self._call("PATCH", f"quantization_jobs?{self._match({'id': job_id})}", fields)
