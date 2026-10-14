@@ -101,7 +101,8 @@ export function AuditResultView({ result }: { result: AuditResult }) {
 }
 
 /** Calibration: plain Q4 against the best imatrix variant. */
-export default function CalibrateResultView({ result, contact }: { result: CalibrateResult; contact?: string }) {
+// FIXED: Changed from 'export default' to 'export function' to match JobView.tsx import mapping
+export function CalibrateResultView({ result, contact }: { result: CalibrateResult; contact?: string }) {
   const model = { results: result.results, variants_meta: null }
   const best = result.best
   const improved = result.decision === 'improved' && best !== null
