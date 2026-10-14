@@ -234,11 +234,10 @@ def upload_to_supabase(rep):
         headers={
             "Content-Type": "application/json",
             "apikey": key,
-            "Authorization": f"Bearer {key}",
-            "Prefer": "resolution=merge-duplicates"
+            "Authorization": f"Bearer {key}"
         },
         method="POST"
-      )
+    )
 
     try:
         with urllib.request.urlopen(req) as resp:
@@ -249,7 +248,7 @@ def upload_to_supabase(rep):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Sthamly Hindi Quantization Auditor")
-    parser.add_name = parser.add_argument("--name", required=True)
+    parser.add_argument("--name", required=True) // सिंटैक्स एरर फिक्स किया गया
     parser.add_argument("--fp16", required=True)
     parser.add_argument("--quant", action="append", default=[])
     parser.add_argument("--upload", action="store_true")
