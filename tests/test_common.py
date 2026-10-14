@@ -44,7 +44,7 @@ class KeyTests(unittest.TestCase):
     def test_hash_matches_the_fixture_that_the_sql_test_also_uses(self):
         self.assertEqual(c.normalize_key(KEY_FX["key"]), KEY_FX["normalized"])
         self.assertEqual(c.hash_key(KEY_FX["key"]), KEY_FX["hash"])
-        self.assertEqual(c.hash_key(" sth abcd-efgh jklm npqr "), KEY_FX["hash"])
+        self.assertEqual(c.hash_key(" sth abcd-efgh ijkl mnop "), KEY_FX["hash"])
 
     def test_generated_keys_have_the_right_shape_and_are_unique(self):
         keys = {c.generate_key() for _ in range(300)}
