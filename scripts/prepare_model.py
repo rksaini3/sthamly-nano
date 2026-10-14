@@ -1,22 +1,13 @@
 """Step 1 of the pipeline: download a model, convert it to FP16 GGUF, and build the
 plain Q4_K_M baseline (no imatrix) from that SAME FP16 file.
-
-Why the baseline is built here: every variant that scripts/trl4_bench.py compares
-(plain, Hindi, English, Mixed imatrix) must come from one FP16 file. An earlier run
-compared a plain Q4 from a different FP16 and showed inflated gains.
-
-Usage (repo root, after scripts/setup.sh):
-    python scripts/prepare_model.py --model Qwen/Qwen2.5-1.5B-Instruct
-
-Next:
-    python scripts/download_hindi_data.py
-    python scripts/trl4_bench.py --model Qwen/Qwen2.5-1.5B-Instruct
 """
 import argparse
 import json
 import os
 import subprocess
 import sys
+import urllib.request
+import urllib.parse
 from pathlib import Path
 
 from huggingface_hub import snapshot_download
@@ -28,24 +19,45 @@ GGUF_DIR = ROOT / "models" / "gguf"
 CONVERT = LLAMA / "convert_hf_to_gguf.py"
 QUANTIZE = LLAMA / "build" / "bin" / "llama-quantize"
 
+CUSTOM_CODE_EXIT = 3
 
 def run(cmd):
-    """Run a command and let its output stream to the terminal (imatrix/convert can take long)."""
+    """Run a command and let its output stream to the terminal."""
     cmd = [str(c) for c in cmd]
-    print("$", " ".join(cmd), flush=True)
+    print("\$", " ".join(cmd), flush=True)
     if subprocess.run(cmd).returncode != 0:
         sys.exit(f"FAILED: {' '.join(cmd[:3])} ...")
 
+def update_db_status(model_id: str, status: str, progress: int):
+    """Pings the Supabase infrastructure layer to synchronize live progress states."""
+    url = os.environ.get("NEXT_PUBLIC_SUPABASE_URL")
+    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+    if not url or not key:
+        return # Skip quietly if running in standalone offline terminal mode
 
-CUSTOM_CODE_EXIT = 3  # scripts/worker.py turns this exit code into a polite refusal for the visitor
-
+    # Perform index lookup on the hf_model_identifier context array
+    pattern = model_id.strip()
+    rpc_url = f"{url.rstrip('/')}/rest/v1/quantization_jobs?hf_model_identifier=eq.{urllib.parse.quote(pattern)}"
+    
+    payload = {
+        "status": status,
+        "progress": progress
+    }
+    
+    req_body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        rpc_url,
+        data=req_body,
+        headers={"Content-Type": "application/json", "apikey": key, "Authorization": f"Bearer {key}"},
+        method="PATCH"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            pass
+    except Exception:
+        pass # Cosmetic logging failure never breaks compilation execution layers
 
 def refuse_custom_code(model_dir: Path) -> None:
-    """Stop if the repo points at custom code (`auto_map`) or has a config we cannot read.
-
-    Only json, safetensors and tokenizer files are downloaded (no .py), but a loader with trust_remote_code
-    could still fetch the code named in auto_map. This project never runs another person's code.
-    """
     for name in ("config.json", "tokenizer_config.json"):
         f = model_dir / name
         if not f.exists():
@@ -58,7 +70,6 @@ def refuse_custom_code(model_dir: Path) -> None:
         if isinstance(data, dict) and "auto_map" in data:
             print(f"REFUSED: {name} me auto_map hai (custom code).")
             sys.exit(CUSTOM_CODE_EXIT)
-
 
 def prepare(model_id: str, hf_token: str | None):
     for need in (CONVERT, QUANTIZE):
@@ -73,24 +84,31 @@ def prepare(model_id: str, hf_token: str | None):
     std = GGUF_DIR / f"{name}-Q4_K_M-standard.gguf"
 
     print("[1/3] Download")
+    # Live progress push: notify frontend that weight extraction matrix has initiated
+    update_db_status(model_id, "extracting", 25)
+    
     snapshot_download(repo_id=model_id, local_dir=str(local), token=hf_token,
                       allow_patterns=["*.json", "*.safetensors", "*.model", "*.txt", "*.tiktoken"])
 
     refuse_custom_code(local)
 
     print("[2/3] Convert to FP16 GGUF")
+    update_db_status(model_id, "extracting", 45)
     if f16.exists():
         print("  FP16 pehle se hai, skip.")
     else:
         run([sys.executable, CONVERT, local, "--outfile", f16, "--outtype", "f16"])
 
     print("[3/3] Plain Q4_K_M (no imatrix), from the same FP16")
+    update_db_status(model_id, "quantizing", 70)
     if std.exists():
         print("  Plain Q4 pehle se hai, skip.")
     else:
         run([QUANTIZE, f16, std, "Q4_K_M"])
 
-    # The FP16 file is kept on purpose: it is the reference for every KLD measurement.
+    # Closing state callback push to signal pipeline graduation down to benchmark nodes
+    update_db_status(model_id, "benchmarking", 85)
+
     print(f"\nTaiyaar:\n  {f16} ({f16.stat().st_size / 1e9:.2f} GB)\n  {std} ({std.stat().st_size / 1e9:.2f} GB)")
     print(f"\nAgla step: python scripts/trl4_bench.py --model {model_id}")
 
