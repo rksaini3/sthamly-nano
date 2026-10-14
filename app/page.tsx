@@ -40,7 +40,7 @@ export default async function Home() {
   const { models, error } = await getModels()
   const contact = safeLink(process.env.NEXT_PUBLIC_CONTACT_URL)
   // The audit really runs only when the Phase 1 backend (db/schema_v3.sql + scripts/worker.py) is switched on.
-  // The input box is typeable either way; without the flag the form just says the audit is not live yet.
+  // Without the flag the form is shown switched off (disabled), with a note, so the layout never jumps.
   const auditOn = process.env.NEXT_PUBLIC_AUDIT_ENABLED === '1'
 
   // The chart shows the first model that has at least two quants measured.
@@ -92,7 +92,7 @@ export default async function Home() {
               note={
                 auditOn ? undefined : (
                   <>
-                    Free audit abhi chalu nahi hua. Model ID likh kar check kar sakte ho.{' '}
+                    Free audit abhi chalu nahi hua.{' '}
                     {contact ? (
                       <a className="text-accent underline underline-offset-2" href={contact}>
                         Pehle audit ke liye contact karo
