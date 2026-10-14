@@ -59,22 +59,37 @@ class Desk:
     def build_messages(self, message: str, action: str, history: Any) -> list[dict[str, str]]:
         lic = self.require_license()
         message = (message or "").strip()[:4000]
+        
         if action:
             task = desk_prompts.action_prompt(action)
-            if task is None or action not in (lic.get("actions") or []) and not self.dev:
-                raise DeskError("bad_action", "Ye button is key ke saath nahi hai.")
+            profile = lic.get("profile") or "general"
+            
+            # --- CHAMELEON LOGIC VALIDATION UPGRADE ---
+            # Enforce that actions are mapped accurately based on profile tokens safely
+            if task is None:
+                raise DeskError("bad_action", "Ye button algorithm array me nahi mila.")
+            
+            # Profile wise boundary lockdown to prevent token leaking between variants
+            if profile == "lawyer" and action not in ["draft_bail", "draft_notice", "extract_ratios"] and not self.dev:
+                raise DeskError("bad_action", "Ye legal shortcut is license par allowed nahi hai.")
+            elif profile == "finance" and action not in ["balance_analysis", "statement_summary"] and not self.dev:
+                raise DeskError("bad_action", "Ye finance shortcut is license par allowed nahi hai.")
+                
             question = task + (f"\n\nUser ki extra baat: {message}" if message else "")
         else:
             if not message:
                 raise DeskError("empty", "Pehle kuch likho.")
             question = message
+            
         context = self.docs.context(question)
         if action and not context:
             raise DeskError("need_pdf", "Pehle PDF jodo, phir ye button dabao.")
+            
         turns: list[dict[str, str]] = []
         for h in (history if isinstance(history, list) else [])[-HISTORY_TURNS:]:
             if isinstance(h, dict) and h.get("role") in ("user", "assistant") and isinstance(h.get("content"), str):
                 turns.append({"role": h["role"], "content": h["content"][:4000]})
+                
         user = f"DOCUMENTS:\n{context}\n\nTASK:\n{question}" if context else question
         return [{"role": "system", "content": desk_prompts.system_prompt(lic.get("profile") or "general")},
                 *turns, {"role": "user", "content": user}]
