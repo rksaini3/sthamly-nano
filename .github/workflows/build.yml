@@ -1,0 +1,38 @@
+name: Automated Windows Compiler Engine
+
+on:
+  push:
+    branches: [ main ] # जैसे ही आप गिटहब पर कोई कोड पेस्ट करेंगे, यह अपने आप .exe बनाएगा
+
+jobs:
+  build:
+    runs-on: windows-latest # गिटहब का असली विंडोज़ कंप्यूटर बैकस्टेज पर चालू होगा
+
+    steps:
+    - name: Clone Repository Footprint
+      uses: actions/checkout@v4
+
+    - name: Initialize Python Production Environment
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    - name: Install PyInstaller and PDF Modules
+      run: |
+        python -m pip install --upgrade pip
+        pip install pyinstaller pypdf
+
+    - name: Freeze Python Code into Clickable Binary (.exe)
+      run: |
+        pyinstaller --onefile --name="SthamlyDesk" --add-data "desk/desk_config.json;." --add-data "desk/desk_ui.py;." --hidden-import=pypdf desk/sthamly_desk.py
+
+    - name: Generate Direct Public Asset Download Link
+      uses: softprops/action-gh-release@v2
+      with:
+        files: dist/SthamlyDesk.exe
+        tag_name: v1.0.0
+        name: Sthamly Desk App Release
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
