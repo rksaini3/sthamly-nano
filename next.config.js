@@ -1,9 +1,7 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  // 1. Turbopack और सर्विंग आर्किटेक्चर के लिए सर्वर कंपोनेंट्स को कड़ाई से ऑप्टिमाइज़ करना
-  experimental: {
-    serverComponentsExternalPackages: ['@supabase/supabase-js'],
-  },
+  // 1. Next.js 16+ Turbopack नियमों के अनुसार बाहरी पैकेजों का ऑप्टिमाइजेशन
+  serverExternalPackages: ['@supabase/supabase-js', 'pdf-lib'],
 
   // 2. वर्सेल क्लीन यूआरएल मैकेनिज्म (Clean URLs): यह 404 रीडायरेक्शन एरर को रोकता है
   trailingSlash: false,
@@ -13,13 +11,13 @@ const nextConfig = {
   async headers() {
     return [
       {
-        // आपके दोनों नए बैकएंड एपीआई पाथ्स को कड़ाई से टारगेट करना
+        // आपके सभी बैकएंड एपीआई पाथ्स को टारगेट करना
         source: '/api/:path*',
         headers: [
           { key: 'Access-Control-Allow-Origin', value: '*' },
           { key: 'Access-Control-Allow-Methods', value: 'GET,POST,OPTIONS' },
           { key: 'Access-Control-Allow-Headers', value: 'Content-Type, Authorization' },
-          // ब्राउज़र को फाइलें कैशे करने से रोकना ताकि 404 दोबारा न आए
+          // ब्राउज़र को फाइलें कैशे करने से रोकना ताकि पुराना ब्लैंक PDF दोबारा न आए
           { key: 'Cache-Control', value: 'no-store, max-age=0, must-revalidate' }
         ],
       },
