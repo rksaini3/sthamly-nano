@@ -1,87 +1,134 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
 
-// सुरक्षित बैकएंड ऑपरेशन्स के लिए सेवा रोल कुंजी (Service Role Key)
+// 1. डेटाबेस कतार (Queue Scheduler) को बिना किसी रुकावट के चलाने के लिए Supabase एडमिन क्लाइंट का निर्माण
+// इसमें आपके .env फ़ाइल से प्रेषित URL और सर्विस रोल कुंजी (Service Role Key) का कड़ाई से उपयोग किया गया है।
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY
+
+if (!supabaseUrl || !supabaseServiceKey) {
+  console.error("CRITICAL ERROR: Supabase environment variables missing inside api/models/route.ts")
+}
+
 const supabaseAdmin = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_ROLE_KEY!
+  supabaseUrl || '',
+  supabaseServiceKey || '',
+  {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false
+    }
+  }
 )
 
 /**
- * GET: एक्टिवेटेड डिवाइस और लाइसेंस की स्थिति ट्रैक करने के लिए (एडमिन डैशबोर्ड हेतु)
+ * ============================================================================
+ * GET: लीडरबोर्ड और पुराने सभी क्वांटाइजेशन डेटा की विस्तृत सूची (Public Access)
+ * ============================================================================
+ * वेबसाइट पर आने वाला कोई भी आम व्यक्ति इसे बिना लॉग-इन या बिना किसी सीक्रेट टोकन के देख सकता है।
+ * यह आपके रिपॉजिटरी की मुख्य 'quantization_jobs' टेबल से डेटा को अवरोही (Descending) क्रम में खींचता है।
  */
 export async function GET() {
   try {
-    const { data, error } = await supabaseAdmin
-      .from('sthamly_licenses') // v2.0 की नई सुरक्षित लाइसेंस टेबल
+    // डेटाबेस से रिकॉर्ड्स का चयन करना
+    const { data: jobsData, error: dbFetchError } = await supabaseAdmin
+      .from('quantization_jobs') // आपके DB Schema की प्रामाणिक टेबल का नाम
       .select('*')
-      .order('activated_at', { ascending: false })
+      .order('created_at', { ascending: false })
 
-    if (error) {
-      return NextResponse.json({ error: error.message }, { status: 500 })
+    // यदि डेटाबेस कोई एरर फेंकता है तो उसे सुरक्षित हैंडल करना
+    if (dbFetchError) {
+      return NextResponse.json(
+        { error: `Database fetch failed: ${dbFetchError.message}` }, 
+        { status: 500 }
+      )
     }
-    return NextResponse.json(data)
-  } catch (err) {
-    return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 })
+
+    // यदि टेबल पूरी तरह खाली है तो खाली एरे भेजना
+    if (!jobsData) {
+      return NextResponse.json([], { status: 200 })
+    }
+
+    // सफ़ल रिस्पॉन्स डेटा भेजना
+    return NextResponse.json(jobsData, { status: 200 })
+
+  } catch (globalCatchError: any) {
+    return NextResponse.json(
+      { error: 'Internal Server Error: GET operation crashed.', details: globalCatchError?.message || '' }, 
+      { status: 500 }
+    )
   }
 }
 
 /**
- * POST: डेस्कटॉप ऐप से आने वाले पेमेंट/एक्टिवेशन रिक्वेस्ट को संभालना (2-Second Activation Engine)
+ * ============================================================================
+ * POST: नया फ्री ऑडिट (Free Hindi Quality Audit) शुरू करने का मुख्य हैंडलर
+ * ============================================================================
+ * इसे आम पब्लिक यूज़र्स बिना किसी 'x-admin-key' या लाइसेंस लॉक के एक्सेस कर सकते हैं।
+ * यह फ्रंटएंड से आने वाले डेटा को आपके डेटाबेस में 'pending' स्थिति के साथ दर्ज करता है।
  */
 export async function POST(req: NextRequest) {
   try {
-    const body = await req.json()
-    const { license_key, hardware_uuid, user_role } = body
+    // 1. आने वाली रिक्वेस्ट की बॉडी (JSON) को पार्स करना
+    const requestBody = await req.json()
     
-    // 1. इनपुट डेटा की जांच
-    if (!license_key || !hardware_uuid || !user_role) {
+    // 2. हाइब्रिड डेटा मैपिंग: फ्रंटएंड के नए वैल्यू मॉडल और पुराने स्कीमा दोनों को सपोर्ट करना
+    // यह फ्रंटएंड के 'value' (hf_model_identifier) और 'modelId' दोनों को सुरक्षित रूप से कलेक्ट करता है।
+    const targetModelIdentifier = requestBody.hf_model_identifier || requestBody.modelId
+
+    // 3. इनपुट चेक: यदि यूजर ने मॉडल का नाम नहीं डाला या फील्ड खाली छोड़ दी
+    if (!targetModelIdentifier || typeof targetModelIdentifier !== 'string' || targetModelIdentifier.trim() === '') {
       return NextResponse.json(
-        { error: 'License Key, Hardware UUID, aur User Role sabhi jaroori hain।' }, 
+        { 
+          error: 'Hugging Face model identifier (hf_model_identifier) ki jaankari gayab hai। Kripya sahi owner/model-name likhein.' 
+        }, 
         { status: 400 }
       )
     }
 
-    // 2. जांचें कि क्या यह चाबी पहले से डेटाबेस में वैध है (पेमेंट स्टेटस चेक)
-    const { data: existingKey, error: fetchError } = await supabaseAdmin
-      .from('sthamly_licenses')
-      .select('*')
-      .eq('license_key', license_key.trim())
-      .single()
+    const cleanModelName = targetModelIdentifier.trim()
 
-    if (fetchError || !existingKey) {
-      return NextResponse.json({ error: 'Galat ya अमान्य Activation Key।' }, { status: 404 })
-    }
-
-    // 3. यदि चाबी पहले से किसी और कंप्यूटर पर एक्टिवेटेड है तो ब्लॉक करें
-    if (existingKey.hardware_uuid && existingKey.hardware_uuid !== hardware_uuid) {
-      return NextResponse.json({ error: 'Yeh key pehle se kisi aur computer par active hai।' }, { status: 400 })
-    }
-
-    // 4. गिरगिट की तरह UI बदलने (Chameleon UI) और कंप्यूटर आईडी को लॉक करने के लिए डेटा अपडेट करें
-    const { data: updatedData, error: updateError } = await supabaseAdmin
-      .from('sthamly_licenses')
-      .update({
-        hardware_uuid: hardware_uuid,
-        status: 'active',
-        user_role: user_role.toLowerCase(), // lawyer, ca, ya student
-        activated_at: new Date().toISOString()
-      })
-      .eq('license_key', license_key.trim())
+    // 4. डेटाबेस में 'pending' स्थिति के साथ नया रो (Row) दर्ज करना 
+    // यहीं से बैकएंड की प्रोग्रेस टेलीमेट्री लूप (worker.py) ट्रिगर होगी
+    const { data: insertedJobRecord, error: dbInsertError } = await supabaseAdmin
+      .from('quantization_jobs')
+      .insert([
+        {
+          hf_model_identifier: cleanModelName,
+          status: 'pending', // डिफ़ॉल्ट रूप से काम पेंडिंग कतार में जाएगा
+          created_at: new Date().toISOString()
+        }
+      ])
       .select()
 
-    if (updateError) {
-      return NextResponse.json({ error: updateError.message }, { status: 500 })
+    // 5. यदि डेटाबेस में डेटा इन्सर्ट करते समय कोई रुकावट या RLS उल्लंघन होता है
+    if (dbInsertError) {
+      return NextResponse.json(
+        { error: `Supabase database insertion error: ${dbInsertError.message}` }, 
+        { status: 500 }
+      )
     }
 
-    // 5. ऐप को सुरक्षित टोकन वापस भेजें जिससे इंटरनेट बंद होने पर भी ऐप 30 दिन चलता रहे
-    return NextResponse.json({
-      success: true,
-      message: 'Activation Safal! Ab aap offline kaam kar sakte hain.',
-      profile: updatedData[0]
-    }, { status: 200 })
+    // 6. यदि डेटा सफलतापूर्वक इन्सर्ट नहीं हो पाया या एरे खाली आया
+    if (!insertedJobRecord || insertedJobRecord.length === 0) {
+      return NextResponse.json(
+        { error: 'Database me job record register nahi ho saka। Kripya thodi der baad prayas karein.' }, 
+        { status: 500 }
+      )
+    }
 
-  } catch (err) {
-    return NextResponse.json({ error: 'रिक्वेस्ट का डेटा या एनक्रिप्टेड फॉर्मेट सही नहीं है।' }, { status: 400 })
+    // 7. नया बना हुआ जॉब डेटा (पहला ऑब्जेक्ट) फ्रंटएंड को वापस भेजना ताकि आपका प्रोग्रेस काउंटर एक्टिव हो सके
+    // यह स्टेटस 201 (Created) के साथ रिस्पॉन्स डिलीवर करता है
+    return NextResponse.json(insertedJobRecord[0], { status: 201 })
+
+  } catch (globalCatchError: any) {
+    // 8. यदि इनपुट डेटा का JSON फॉर्मेट ही खराब है या सर्वर क्रैश होता है
+    return NextResponse.json(
+      { 
+        error: 'Request ka JSON format sahi nahi hai ya network handshake asafal raha.',
+        details: globalCatchError?.message || ''
+      }, 
+      { status: 400 }
+    )
   }
 }
