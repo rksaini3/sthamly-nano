@@ -1,22 +1,21 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
 
-// बैकएंड कतार (Queue Scheduler) को बिना किसी बाधा के चलाने के लिए सेवा रोल कुंजी (Service Role Key) का उपयोग
+// सुरक्षित बैकएंड ऑपरेशन्स के लिए सेवा रोल कुंजी (Service Role Key)
 const supabaseAdmin = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 )
 
 /**
- * GET: पुराना डेटा और लीडरबोर्ड दिखाता है।
- * वेबसाइट पर आने वाला कोई भी व्यक्ति इसे बिना लॉग-इन के देख सकता है।
+ * GET: एक्टिवेटेड डिवाइस और लाइसेंस की स्थिति ट्रैक करने के लिए (एडमिन डैशबोर्ड हेतु)
  */
 export async function GET() {
   try {
     const { data, error } = await supabaseAdmin
-      .from('quantization_jobs') // आपके DB Schema की सही टेबल का नाम
+      .from('sthamly_licenses') // v2.0 की नई सुरक्षित लाइसेंस टेबल
       .select('*')
-      .order('created_at', { ascending: false })
+      .order('activated_at', { ascending: false })
 
     if (error) {
       return NextResponse.json({ error: error.message }, { status: 500 })
@@ -28,38 +27,61 @@ export async function GET() {
 }
 
 /**
- * POST: नया फ्री ऑडिट (Free Audit) शुरू करता है।
- * इसे आम पब्लिक यूज़र्स बिना किसी 'x-admin-key' या एडमिन लॉक के एक्सेस कर सकते हैं।
+ * POST: डेस्कटॉप ऐप से आने वाले पेमेंट/एक्टिवेशन रिक्वेस्ट को संभालना (2-Second Activation Engine)
  */
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json()
+    const { license_key, hardware_uuid, user_role } = body
     
-    // इनपुट चेक: सुनिश्चित करें कि यूजर ने मॉडल आईडी प्रदान की है
-    if (!body.hf_model_identifier) {
+    // 1. इनपुट डेटा की जांच
+    if (!license_key || !hardware_uuid || !user_role) {
       return NextResponse.json(
-        { error: 'Hugging Face model identifier (hf_model_identifier) की जानकारी गायब है।' }, 
+        { error: 'License Key, Hardware UUID, aur User Role sabhi jaroori hain।' }, 
         { status: 400 }
       )
     }
 
-    // डेटाबेस में 'pending' स्थिति के साथ नया काम दर्ज करें ताकि worker.py इसे तुरंत उठा सके
-    const { data, error } = await supabaseAdmin
-      .from('quantization_jobs')
-      .insert({
-        hf_model_identifier: body.hf_model_identifier.trim(),
-        status: 'pending' // यहाँ से बैकएंड की प्रोग्रेस टेलीमेट्री लूप ट्रिगर होगी
-      })
-      .select()
+    // 2. जांचें कि क्या यह चाबी पहले से डेटाबेस में वैध है (पेमेंट स्टेटस चेक)
+    const { data: existingKey, error: fetchError } = await supabaseAdmin
+      .from('sthamly_licenses')
+      .select('*')
+      .eq('license_key', license_key.trim())
+      .single()
 
-    if (error) {
-      return NextResponse.json({ error: error.message }, { status: 500 })
+    if (fetchError || !existingKey) {
+      return NextResponse.json({ error: 'Galat ya अमान्य Activation Key।' }, { status: 404 })
     }
 
-    // नया बना हुआ जॉब डेटा वापस फ्रंटेंड को भेजें (201 Created)
-    return NextResponse.json(data[0] || data, { status: 201 })
+    // 3. यदि चाबी पहले से किसी और कंप्यूटर पर एक्टिवेटेड है तो ब्लॉक करें
+    if (existingKey.hardware_uuid && existingKey.hardware_uuid !== hardware_uuid) {
+      return NextResponse.json({ error: 'Yeh key pehle se kisi aur computer par active hai।' }, { status: 400 })
+    }
+
+    // 4. गिरगिट की तरह UI बदलने (Chameleon UI) और कंप्यूटर आईडी को लॉक करने के लिए डेटा अपडेट करें
+    const { data: updatedData, error: updateError } = await supabaseAdmin
+      .from('sthamly_licenses')
+      .update({
+        hardware_uuid: hardware_uuid,
+        status: 'active',
+        user_role: user_role.toLowerCase(), // lawyer, ca, ya student
+        activated_at: new Date().toISOString()
+      })
+      .eq('license_key', license_key.trim())
+      .select()
+
+    if (updateError) {
+      return NextResponse.json({ error: updateError.message }, { status: 500 })
+    }
+
+    // 5. ऐप को सुरक्षित टोकन वापस भेजें जिससे इंटरनेट बंद होने पर भी ऐप 30 दिन चलता रहे
+    return NextResponse.json({
+      success: true,
+      message: 'Activation Safal! Ab aap offline kaam kar sakte hain.',
+      profile: updatedData[0]
+    }, { status: 200 })
 
   } catch (err) {
-    return NextResponse.json({ error: 'रिक्वेस्ट का JSON फॉर्मेट या डेटा सही नहीं है।' }, { status: 400 })
+    return NextResponse.json({ error: 'रिक्वेस्ट का डेटा या एनक्रिप्टेड फॉर्मेट सही नहीं है।' }, { status: 400 })
   }
 }
