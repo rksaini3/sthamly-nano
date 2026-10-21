@@ -7,22 +7,20 @@ const nextConfig = {
   trailingSlash: false,
   poweredByHeader: false,
 
-  // 3. गूगल ड्राइव डायरेक्ट डाउनलोड रीडायरेक्ट्स (बिना किसी क्रेडिट कार्ड झंझट के)
+  // 3. GitHub Releases से SthamlyDesk.zip का सीधा और सुरक्षित डाउनलोड रीडायरेक्ट्स
   async redirects() {
-    // ⚠️ निर्देश: अपनी Google Drive फ़ाइल के 'Share' लिंक से ID निकालकर यहाँ बदलें
-    // उदाहरण: यदि लिंक https://google.com है, तो ID '1A2b3C...' होगी।
-    const WINDOWS_DRIVE_ID = 'YOUR_WINDOWS_FILE_ID_HERE'; 
-    const MAC_DRIVE_ID = 'YOUR_MAC_FILE_ID_HERE';
+    // स्क्रीनशॉट के अनुसार सटीक रिलीज पाथ और ज़िप फ़ाइल का नाम
+    const GITHUB_ZIP_URL = 'https://github.com';
 
     return [
       {
         source: '/download/windows',
-        destination: `https://google.com{WINDOWS_DRIVE_ID}`,
-        permanent: false, // फ़ाइल अपडेट होने पर कैशे की समस्या से बचने के लिए false रखें
+        destination: GITHUB_ZIP_URL, // सीधे ज़िप फ़ाइल पर भेजेगा
+        permanent: false, 
       },
       {
         source: '/download/mac',
-        destination: `https://google.com{MAC_DRIVE_ID}`,
+        destination: GITHUB_ZIP_URL, // सीधे ज़िप फ़ाइल पर भेजेगा
         permanent: false,
       },
     ];
@@ -32,13 +30,11 @@ const nextConfig = {
   async headers() {
     return [
       {
-        // आपके सभी बैकएंड एपीआई पाथ्स को टारगेट करना
         source: '/api/:path*',
         headers: [
           { key: 'Access-Control-Allow-Origin', value: '*' },
           { key: 'Access-Control-Allow-Methods', value: 'GET,POST,OPTIONS' },
           { key: 'Access-Control-Allow-Headers', value: 'Content-Type, Authorization' },
-          // ब्राउज़र को फाइलें कैशे करने से रोकना ताकि पुराना ब्लैंक PDF दोबारा न आए
           { key: 'Cache-Control', value: 'no-store, max-age=0, must-revalidate' }
         ],
       },
