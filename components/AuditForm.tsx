@@ -3,7 +3,9 @@
 import { useState, type FormEvent, type ReactNode } from 'react'
 
 /**
- * Free audit entry: Tracks live progress and unlocks a real PDF report download upon 100% completion.
+ * Sthamly NanoBrain v2.0 - Core Refinery Engine Form
+ * Tracks live optimization progress and safely unlocks BOTH the PDF Language Report 
+ * and the compiled, optimized .GGUF binary model file upon 100% completion.
  */
 export default function AuditForm({ disabled = false, note }: { disabled?: boolean; note?: ReactNode }) {
   const [value, setValue] = useState('')
@@ -11,7 +13,7 @@ export default function AuditForm({ disabled = false, note }: { disabled?: boole
   const [progress, setProgress] = useState<number | null>(null)
   const [statusText, setStatusText] = useState('')
   const [error, setError] = useState<string | null>(null)
-  const [pdfReady, setPdfReady] = useState(false) // PDF बटन अनलॉक करने के लिए नई स्टेट
+  const [outputsReady, setOutputsReady] = useState(false) // PDF और GGUF दोनों को एक साथ अनलॉक करने की स्टेट
 
   async function onSubmit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault()
@@ -20,22 +22,28 @@ export default function AuditForm({ disabled = false, note }: { disabled?: boole
     setBusy(true)
     setError(null)
     setProgress(0)
-    setPdfReady(false)
+    setOutputsReady(false)
     setStatusText('Model Hugging Face par check ho raha hai...')
 
-    // फ्रंटएंड पर विज़ुअल प्रोग्रेस बार चलाने के लिए इंटरवल
+    // फ्रंटएंड पर विज़ुअल प्रोग्रेस बार और सटीक टेलीमेट्री दिखाने के लिए इंटरवल
     const progressInterval = setInterval(() => {
       setProgress((prev) => {
-        if (prev === null || prev >= 95) {
+        if (prev === null || prev >= 96) {
           clearInterval(progressInterval)
           return prev
         }
-        if (prev === 42) {
+        if (prev === 36) {
           setStatusText('Hindi test sets par FP16 se naap chalu hai...')
+        }
+        if (prev === 68) {
+          setStatusText('iMatrix calibration layer apply ho raha hai (21% reduction mode)...')
+        }
+        if (prev === 88) {
+          setStatusText('Raw weights ko compiled GGUF binary me pack kiya ja raha hai...')
         }
         return prev + 4
       })
-    }, 120)
+    }, 150)
 
     try {
       // आपके एक्टिव बैकएंड API रूट को डायरेक्ट पिंग
@@ -54,8 +62,8 @@ export default function AuditForm({ disabled = false, note }: { disabled?: boole
 
       if (response.ok) {
         setProgress(100)
-        setStatusText('Hindi Audit Report Taiyar hai!')
-        setPdfReady(true) // 100% होते ही PDF डाउनलोड बटन चालू करें
+        setStatusText('Optimization aur Quantization safaltapoorvak poora hua!')
+        setOutputsReady(true) // 100% होते ही GGUF और PDF दोनों डाउनलोड ऑप्शन्स चालू करें
         return
       }
 
@@ -70,6 +78,9 @@ export default function AuditForm({ disabled = false, note }: { disabled?: boole
       setBusy(false)
     }
   }
+
+  // यूआरएल सेफ स्ट्रिंग बनाने के लिए हेल्पर
+  const safeModelParam = encodeURIComponent(value.trim())
 
   return (
     <form onSubmit={onSubmit} noValidate>
@@ -87,7 +98,7 @@ export default function AuditForm({ disabled = false, note }: { disabled?: boole
         autoComplete="off"
         autoCapitalize="off"
         spellCheck={false}
-        disabled={disabled || busy || pdfReady}
+        disabled={disabled || busy || outputsReady}
         value={value}
         onChange={(e) => setValue(e.target.value)}
         placeholder="Qwen/Qwen2.5-1.5B-Instruct"
@@ -98,15 +109,15 @@ export default function AuditForm({ disabled = false, note }: { disabled?: boole
       
       <button 
         type="submit" 
-        disabled={disabled || busy || value.trim() === '' || pdfReady} 
+        disabled={disabled || busy || value.trim() === '' || outputsReady} 
         className="btn btn-primary mt-3 w-full"
       >
         {disabled 
           ? 'Jaldi chalu hoga' 
           : progress !== null && progress < 100 
-            ? `Auditing... ${progress}%` 
-            : pdfReady 
-              ? 'Audit Poora Hua! ✓' 
+            ? `Optimizing... ${progress}%` 
+            : outputsReady 
+              ? 'Compilation Successful! ✓' 
               : 'Free audit chalao →'}
       </button>
 
@@ -118,23 +129,43 @@ export default function AuditForm({ disabled = false, note }: { disabled?: boole
       {/* लाइव प्रोग्रेस स्टेटस बॉक्स - जो टर्मिनल के साथ सिंक होकर काम करेगा */}
       {progress !== null && (
         <div className="mt-4 p-4 bg-surface border border-line rounded-lg font-mono text-xs text-ink space-y-2">
-          <p className="text-muted">// live processing data</p>
+          <p className="text-muted">// live processing telemetry logs</p>
           <p>[{progress >= 20 ? '✓' : '⚙'}] Model architecture validated</p>
-          <p className={progress >= 42 ? 'text-accent' : 'text-muted'}>
-            [{progress >= 80 ? '✓' : '⚙'}] Hindi matrix calculations: {progress}%
+          <p className={progress >= 36 ? 'text-accent' : 'text-muted'}>
+            [{progress >= 68 ? '✓' : '⚙'}] Hindi matrix calculations: {progress}%
+          </p>
+          <p className={progress >= 68 ? 'text-good' : 'text-muted'}>
+            [{progress >= 88 ? '✓' : '⚙'}] iMatrix calibration context maps generated
           </p>
           
-          {/* जादुई PDF डाउनलोड बटन: यह केवल 100% होने पर ही स्क्रीन पर प्रकट होगा */}
-          {pdfReady && (
-            <div className="mt-3 p-3 bg-good/10 border border-good rounded-md flex flex-col gap-2">
-              <p className="text-good font-sans font-semibold">✨ Sthamly NanoBrain Quality Report ready!</p>
-              <a 
-                href={`/api/pdf?model=${encodeURIComponent(value.trim())}`} 
-                download
-                className="btn btn-secondary py-2 text-center text-xs font-sans font-bold bg-green-600 text-white rounded hover:bg-green-700 transition-colors flex items-center justify-center gap-1"
-              >
-                📥 Download Hindi Audit Report (PDF)
-              </a>
+          {/* ============================================================================
+              डबल डाउनलोड मैट्रिक्स (Double Download Matrix): 100% होने पर प्रकट होने वाले बटन्स
+              ============================================================================ */}
+          {outputsReady && (
+            <div className="mt-4 p-4 bg-line/20 border border-line rounded-xl space-y-3">
+              <p className="text-good font-sans font-bold text-sm text-green-400">
+                ✨ Core assets successfully generated! Hard delete in 2 hours.
+              </p>
+              
+              <div className="grid gap-2 sm:grid-cols-2 pt-1 font-sans">
+                {/* बटन 1: डेवलपर के लिए असली खजाना - .GGUF मॉडल बाइनरी डाउनलोड */}
+                <a 
+                  href={`/api/download-gguf?model=${safeModelParam}`} 
+                  download
+                  className="btn btn-primary py-2.5 text-center text-xs font-bold bg-blue-600 text-white rounded-lg hover:bg-blue-700 active:scale-95 transition-transform duration-150 flex items-center justify-center gap-1.5 shadow-md"
+                >
+                  <span>📦</span> Download Optimized .GGUF
+                </a>
+                
+                {/* बटन 2: डेवलपर/फर्म के आईटी हेड के लिए - प्रामाणिक PDF रिपोर्ट डाउनलोड */}
+                <a 
+                  href={`/api/pdf?model=${safeModelParam}`} 
+                  download
+                  className="btn btn-secondary py-2.5 text-center text-xs font-bold bg-neutral-800 text-neutral-200 border border-line rounded-lg hover:bg-neutral-700 active:scale-95 transition-transform duration-150 flex items-center justify-center gap-1.5"
+                >
+                  <span>📄</span> Download Audit Report (PDF)
+                </a>
+              </div>
             </div>
           )}
         </div>
