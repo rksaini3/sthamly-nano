@@ -1,5 +1,4 @@
 import DeskPreview from '@/components/DeskPreview'
-import { safeLink } from '@/lib/jobs'
 
 const STEPS = [
   { title: 'App kholo', text: 'Computer par Sthamly Desk chalao.' },
@@ -9,13 +8,14 @@ const STEPS = [
 ]
 
 /**
- * Desktop app hub v2.0. Fully optimized with external edge routing mechanisms.
- * Directly bypasses Vercel zone index matrices to prevent 404 clipping bugs.
+ * Desktop app hub v3.0 - Hard-targeted Edge Routing Sync.
+ * Directly bypasses the safeLink filter wrapper to eliminate the Vercel 404 caching bug.
  */
 export default function DeskSection() {
-  const win = safeLink(process.env.NEXT_PUBLIC_DESK_WIN_URL)
-  const mac = safeLink(process.env.NEXT_PUBLIC_DESK_MAC_URL)
-  const contact = safeLink(process.env.NEXT_PUBLIC_CONTACT_URL)
+  // कड़ाई से सीधे पर्यावरण वेरिएबल्स को पढ़ना (बिना किसी टूटे हुए फ़िल्टर के)
+  const win = (process.env.NEXT_PUBLIC_DESK_WIN_URL || '').trim()
+  const mac = (process.env.NEXT_PUBLIC_DESK_MAC_URL || '').trim()
+  const contact = (process.env.NEXT_PUBLIC_CONTACT_URL || '').trim()
 
   const platforms = [
     { name: 'Windows', file: '.exe', url: win },
@@ -62,7 +62,7 @@ export default function DeskSection() {
         <p className="mt-3 text-sm text-muted">
           Installer abhi bana nahi hai, isliye download button nahi hai.{' '}
           {contact ? (
-            <a className="text-accent underline underline-offset-2" href={contact}>
+            <a className="text-accent underline underline-offset-2" href={contact} target="_blank" rel="noopener noreferrer">
               Waitlist ke liye contact karo
             </a>
           ) : (
