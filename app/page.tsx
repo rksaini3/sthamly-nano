@@ -106,70 +106,26 @@ export default async function Home() {
 
           {/* Cross-Platform Download Matrix */}
           <div className="mt-8 flex flex-col sm:flex-row justify-center gap-4">
-            <a href="/downloads/sthamly-desk-setup.exe" className="btn btn-primary px-8 py-4 flex items-center justify-center gap-2 text-base font-semibold shadow-lg hover:scale-105 transition-transform duration-200">
-              <span>📥</span> Windows (.exe) Installer Download
-            </a>
-            <a href="/downloads/sthamly-desk-setup.dmg" className="btn btn-secondary px-8 py-4 flex items-center justify-center gap-2 text-base font-semibold border border-line hover:bg-surface transition-colors duration-200">
-              <span>🍏</span> Mac (.dmg) Installer Download
-            </a>
+            {/* Windows Secure Download Link */}
+            <Link 
+              href="/download/windows" 
+              className="btn btn-primary px-8 py-3 text-base font-semibold shadow-md rounded-xl flex items-center justify-center gap-2"
+            >
+              <span>📥</span> Download for Windows (.exe)
+            </Link>
+
+            {/* Mac Secure Download Link */}
+            <Link 
+              href="/download/mac" 
+              className="btn btn-secondary px-8 py-3 text-base font-semibold shadow-md rounded-xl flex items-center justify-center gap-2"
+            >
+              <span>🍏</span> Download for Mac (.dmg)
+            </Link>
           </div>
-
-          {/* Chameleon Setup Process Note */}
-          <div className="mt-10 grid gap-4 text-left sm:grid-cols-3 border-t border-line/60 pt-8 font-sans text-sm">
-            <div className="p-4 bg-surface rounded-xl border border-line/40">
-              <span className="text-brand font-mono font-bold block mb-1">01. App Kholo</span>
-              <p className="text-xs text-muted">Computer par software install karke chalao.</p>
-            </div>
-            <div className="p-4 bg-surface rounded-xl border border-line/40">
-              <span className="text-brand font-mono font-bold block mb-1">02. Key Daalo (Chameleon)</span>
-              <p className="text-xs text-muted">Apni unique STH-XXXX key daalein। Yeh key aapka UI (Legal, CA, Student) khud chun legi।</p>
-            </div>
-            <div className="p-4 bg-surface rounded-xl border border-line/40">
-              <span className="text-brand font-mono font-bold block mb-1">03. 100% Offline Kaam</span>
-              <p className="text-xs text-muted">Sirf 2 second ka activation check, uske baad bina internet poora app offline chalao।</p>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      {/* ------------------------------------------------------------ MIDDLE: Diagnostic */}
-      {showDiagnostic && (
-        <section className="mt-20 border-t border-line pt-14" aria-labelledby="diagnostic-title">
-          <h2 id="diagnostic-title" className="font-display text-2xl font-bold tracking-tight sm:text-3xl">
-            Diagnostic Dashboard
-          </h2>
-          {error ? (
-            <ErrorNote message="Data load karne me dikkat aayi. Kripya baad me check karein." />
-          ) : hero ? (
-            <div className="mt-8 grid gap-8 lg:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)]">
-              <div>
-                <KldChart model={hero} />
-              </div>
-              <div className="space-y-6">
-                <ModelCard model={hero} />
-              </div>
-            </div>
-          ) : (
-            <div className="mt-6 rounded-xl border border-line bg-surface p-6 text-center text-muted">
-              <p className="font-semibold text-ink text-base">Abhi koi result nahi hai</p>
-              <p className="mt-2 text-sm">Pehla model naapte hi yahan FP16 se doori ka chart dikhega.</p>
-            </div>
-          )}
-        </section>
-      )}
-
-      {/* ------------------------------------------------------------ BOTTOM: Manual */}
-      <section className="mt-20 border-t border-line pt-14" aria-labelledby="manual-title">
-        <h2 id="manual-title" className="font-display text-2xl font-bold tracking-tight sm:text-3xl">
-          Chart kaise padhein
-        </h2>
-        <div className="mt-8 grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
-          {HOW_TO_READ.map((item) => (
-            <div key={item.term} className="rounded-xl border border-line bg-surface p-5">
-              <h3 className="font-bold text-ink">{item.term}</h3>
-              <p className="mt-2 text-sm text-muted">{item.text}</p>
-            </div>
-          ))}
+          
+          <p className="mt-4 text-xs text-muted font-mono">
+            * Setup runtime configuration verified via Cloudflare R2 secure pipeline.
+          </p>
         </div>
       </section>
     </Main>
