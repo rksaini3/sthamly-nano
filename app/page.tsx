@@ -106,25 +106,25 @@ export default async function Home() {
 
           {/* Cross-Platform Download Matrix */}
           <div className="mt-8 flex flex-col sm:flex-row justify-center gap-4">
-            {/* Windows Secure Download Link */}
+            {/* Safe Internal Redirect Link for Windows */}
             <Link 
               href="/download/windows" 
-              className="btn btn-primary px-8 py-3 text-base font-semibold shadow-md rounded-xl flex items-center justify-center gap-2"
+              className="btn btn-primary px-8 py-3 text-base font-semibold shadow-sm rounded-xl flex items-center justify-center gap-2"
             >
-              <span>📥</span> Download for Windows (.exe)
+              📥 Download for Windows (.exe)
             </Link>
 
-            {/* Mac Secure Download Link */}
+            {/* Safe Internal Redirect Link for Mac */}
             <Link 
               href="/download/mac" 
               className="btn btn-secondary px-8 py-3 text-base font-semibold shadow-md rounded-xl flex items-center justify-center gap-2"
             >
-              <span>🍏</span> Download for Mac (.dmg)
+              🍏 Download for Mac (.dmg)
             </Link>
           </div>
           
           <p className="mt-4 text-xs text-muted font-mono">
-            * Setup runtime configuration verified via Cloudflare R2 secure pipeline.
+            * Setup runtime links routed securely via configuration engine.
           </p>
         </div>
       </section>
