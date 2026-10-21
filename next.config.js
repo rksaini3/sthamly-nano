@@ -7,7 +7,38 @@ const nextConfig = {
   trailingSlash: false,
   poweredByHeader: false,
 
-  // 3. डबल डाउनलोड मैट्रिक्स सुरक्षा: बैकएंड रूट्स के लिए CORS और हेडर सपोर्ट को कड़ाई से लागू करना
+  // 3. क्लाउडफ्लेयर R2 रीडायरेक्ट्स: 404 एरर को रोकने और भारी इंस्टॉलर को R2 से डाउनलोड कराने के लिए
+  async redirects() {
+    // यहाँ अपनी Cloudflare R2 की Public URL या Custom Domain डालें
+    const R2_URL = 'https://sthamly.in'; 
+
+    return [
+      {
+        source: '/download/windows',
+        destination: `${R2_URL}/Sthamly_Setup.exe`,
+        permanent: false, // अस्थाई (false) रखें ताकि फाइल अपडेट होने पर कैशे की समस्या न हो
+      },
+      {
+        source: '/download/mac',
+        destination: `${R2_URL}/Sthamly_Setup.dmg`,
+        permanent: false,
+      },
+    ];
+  },
+
+  // 4. अगर भविष्य में R2 से इमेज या एसेट्स वेबसाइट पर दिखाने हों तो रिमोट पैटर्न कॉन्फ़िगरेशन
+  images: {
+    remotePatterns: [
+      {
+        protocol: 'https',
+        hostname: 'download.sthamly.in', // अपना R2 कस्टम डोमेन यहाँ बदलें
+        port: '',
+        pathname: '/assets/**',
+      },
+    ],
+  },
+
+  // 5. डबल डाउनलोड मैट्रिक्स सुरक्षा: बैकएंड रूट्स के लिए CORS और हेडर सपोर्ट को कड़ाई से लागू करना
   async headers() {
     return [
       {
