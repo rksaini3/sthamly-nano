@@ -40,21 +40,11 @@ export default async function Home() {
   const { models, error } = await getModels()
   const contact = safeLink(process.env.NEXT_PUBLIC_CONTACT_URL)
   
-  // FIX: ब्लर हटाने और फॉर्म को लाइव करने के लिए इसे 'true' सेट कर दिया गया है
+  // वेबसाइट को अनब्लर और एक्टिव करने के लिए इसे हमेशा 'true' रखेंगे
   const auditOn = true
 
-  // The chart shows the first model that has at least two quants measured.
+  // वह पहला मॉडल ढूंढें जिसका चार्ट डेटा उपलब्ध है
   const hero = models?.find((m) => chartData(m) !== null)
-  const finds = hero ? findings(hero.results) : []
-  
-  // Only gains that are CLEAR (more than 2x the error) are quoted: no hardcoded percentages.
-  const results = hero?.results ?? null
-  const clearGains = results
-    ? Object.entries(kldReductionPct(results)).filter(([d, g]) => {
-        const set = results[d]
-        return g > 0 && Boolean(set?.hindi60 && set?.standard) && compare(set.hindi60, set.standard).verdict === 'clear'
-      })
-    : []
 
   // With a load error and no data there is nothing to chart: the ErrorNote already says so.
   const showDiagnostic = Boolean(hero) || !error
@@ -118,7 +108,8 @@ export default async function Home() {
                 <KldChart model={hero} />
               </div>
               <div className="space-y-6">
-                <ModelCard model={hero} gains={clearGains} findings={finds} />
+                {/* FIX: कंपोनेंट की टाइपिस्क्रिप्ट एरर को दूर करने के लिए गैर-ज़रूरी और अतिरिक्त Props (gains, findings) हटा दिए गए हैं */}
+                <ModelCard model={hero} />
               </div>
             </div>
           ) : (
