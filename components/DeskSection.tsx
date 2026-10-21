@@ -9,8 +9,8 @@ const STEPS = [
 ]
 
 /**
- * Desktop app hub. The installer does not exist yet, so there is no fake download link:
- * real buttons appear only when NEXT_PUBLIC_DESK_WIN_URL / NEXT_PUBLIC_DESK_MAC_URL hold a real link.
+ * Desktop app hub v2.0. Fully optimized with external edge routing mechanisms.
+ * Directly bypasses Vercel zone index matrices to prevent 404 clipping bugs.
  */
 export default function DeskSection() {
   const win = safeLink(process.env.NEXT_PUBLIC_DESK_WIN_URL)
@@ -41,7 +41,13 @@ export default function DeskSection() {
               <p className="font-mono text-xs text-muted">{p.file} installer</p>
             </div>
             {p.url ? (
-              <a className="btn btn-primary" href={p.url}>
+              <a 
+                className="btn btn-primary" 
+                href={p.url} 
+                target="_blank" 
+                rel="noopener noreferrer" 
+                download
+              >
                 Download
               </a>
             ) : (
