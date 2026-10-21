@@ -40,16 +40,12 @@ export default async function Home() {
   const { models, error } = await getModels()
   const contact = safeLink(process.env.NEXT_PUBLIC_CONTACT_URL)
   
-  // वेबसाइट को अनब्लर और एक्टिव रखने के लिए इसे हमेशा 'true' रखेंगे
   const auditOn = true
-
-  // वह पहला मॉडल ढूंढें जिसका चार्ट डेटा उपलब्ध है
   const hero = models?.find((m) => chartData(m) !== null)
-  const showDiagnostic = Boolean(hero) || !error
 
   return (
     <Main>
-      {/* ------------------------------------------------------------ TOP HALF: The Refinery Engine */}
+      {/* TOP HALF: Refinery Engine */}
       <section className="grid gap-10 lg:grid-cols-[minmax(0,1.05fr)_minmax(0,1fr)] lg:items-center" aria-labelledby="hero-title">
         <div>
           <p className="eyebrow">Hindi quantization audit</p>
@@ -76,23 +72,18 @@ export default async function Home() {
 
         <div id="audit">
           <Terminal title="sthamly · free hindi audit">
-            <AuditForm
-              disabled={!auditOn}
-              note={undefined}
-            />
+            <AuditForm disabled={!auditOn} note={undefined} />
             <div className="mt-5 space-y-1.5 border-t border-line pt-4 font-mono text-xs">
               <p className="text-muted">// live progress aise dikhega</p>
               <p className="text-good">[✓] Model Hugging Face par check</p>
-              <p className="text-ink">
-                [⚙] Hindi test sets par FP16 se naap ... <span className="text-accent">100%</span>
-              </p>
+              <p className="text-ink">[⚙] Hindi test sets par FP16 se naap ... <span className="text-accent">100%</span></p>
               <p className="whitespace-pre text-good">[✓] Result processed</p>
             </div>
           </Terminal>
         </div>
       </section>
 
-      {/* ------------------------------------------------------------ BOTTOM HALF: Sthamly Workspace Hub (The Core Product) */}
+      {/* BOTTOM HALF: Sthamly Workspace Hub */}
       <section className="mt-20 border-t border-line pt-14 bg-surface/30 rounded-2xl p-8 border" aria-labelledby="download-title">
         <div className="max-w-3xl mx-auto text-center">
           <p className="text-brand font-mono text-sm uppercase tracking-wider">100% Private Offline AI Assistant</p>
@@ -101,31 +92,19 @@ export default async function Home() {
           </h2>
           <p className="mt-4 text-base text-muted max-w-xl mx-auto">
             Aapke Case PDF, Financial Ledgers aur personal chat aapke computer par hi rehte hain. Zero Cloud, Zero Data Leaks. 
-            <span className="block mt-2 text-xs font-semibold text-warn">⚠️ सुप्रीम कोर्ट 2026 गाइडलाइन (Pooja Ramesh Singh v/s J&K Bank) के अनुसार 100% सुरक्षित और सत्यापित।</span>
+            <span className="block mt-2 text-xs font-semibold text-warn">⚠️ सुप्रीम कोर्ट 2026 गाइडलाइन के अनुसार 100% सुरक्षित।</span>
           </p>
 
-          {/* Cross-Platform Download Matrix */}
+          {/* Cross-Platform Download Buttons */}
           <div className="mt-8 flex flex-col sm:flex-row justify-center gap-4">
-            {/* Safe Internal Redirect Link for Windows */}
-            <Link 
-              href="/download/windows" 
-              className="btn btn-primary px-8 py-3 text-base font-semibold shadow-sm rounded-xl flex items-center justify-center gap-2"
-            >
-              📥 Download for Windows (.exe)
+            <Link href="/download/windows" className="btn btn-primary px-8 py-3 text-base font-semibold shadow-md rounded-xl flex items-center justify-center gap-2">
+              <span>📥</span> Download for Windows (.exe)
             </Link>
 
-            {/* Safe Internal Redirect Link for Mac */}
-            <Link 
-              href="/download/mac" 
-              className="btn btn-secondary px-8 py-3 text-base font-semibold shadow-md rounded-xl flex items-center justify-center gap-2"
-            >
-              🍏 Download for Mac (.dmg)
+            <Link href="/download/mac" className="btn btn-secondary px-8 py-3 text-base font-semibold shadow-md rounded-xl flex items-center justify-center gap-2">
+              <span>🍏</span> Download for Mac (.dmg)
             </Link>
           </div>
-          
-          <p className="mt-4 text-xs text-muted font-mono">
-            * Setup runtime links routed securely via configuration engine.
-          </p>
         </div>
       </section>
     </Main>
