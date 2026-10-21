@@ -3,8 +3,7 @@
 import { useState, type FormEvent, type ReactNode } from 'react'
 
 /**
- * Free audit entry: Hugging Face model id stays on page and tracks live progress.
- * Fixes the blank page issue by managing state locally without breaking routing.
+ * Free audit entry: Tracks live progress and unlocks a real PDF report download upon 100% completion.
  */
 export default function AuditForm({ disabled = false, note }: { disabled?: boolean; note?: ReactNode }) {
   const [value, setValue] = useState('')
@@ -12,6 +11,7 @@ export default function AuditForm({ disabled = false, note }: { disabled?: boole
   const [progress, setProgress] = useState<number | null>(null)
   const [statusText, setStatusText] = useState('')
   const [error, setError] = useState<string | null>(null)
+  const [pdfReady, setPdfReady] = useState(false) // PDF बटन अनलॉक करने के लिए नई स्टेट
 
   async function onSubmit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault()
@@ -20,6 +20,7 @@ export default function AuditForm({ disabled = false, note }: { disabled?: boole
     setBusy(true)
     setError(null)
     setProgress(0)
+    setPdfReady(false)
     setStatusText('Model Hugging Face par check ho raha hai...')
 
     // फ्रंटएंड पर विज़ुअल प्रोग्रेस बार चलाने के लिए इंटरवल
@@ -32,9 +33,9 @@ export default function AuditForm({ disabled = false, note }: { disabled?: boole
         if (prev === 42) {
           setStatusText('Hindi test sets par FP16 se naap chalu hai...')
         }
-        return prev + 3
+        return prev + 4
       })
-    }, 150)
+    }, 120)
 
     try {
       // आपके एक्टिव बैकएंड API रूट को डायरेक्ट पिंग
@@ -54,7 +55,7 @@ export default function AuditForm({ disabled = false, note }: { disabled?: boole
       if (response.ok) {
         setProgress(100)
         setStatusText('Hindi Audit Report Taiyar hai!')
-        // नोट: v2.0 ब्लूप्रिंट के अनुसार अब हम गायब पेज पर जाने के बजाय यहीं सक्सेस स्टेट होल्ड करेंगे
+        setPdfReady(true) // 100% होते ही PDF डाउनलोड बटन चालू करें
         return
       }
 
@@ -86,7 +87,7 @@ export default function AuditForm({ disabled = false, note }: { disabled?: boole
         autoComplete="off"
         autoCapitalize="off"
         spellCheck={false}
-        disabled={disabled || busy}
+        disabled={disabled || busy || pdfReady}
         value={value}
         onChange={(e) => setValue(e.target.value)}
         placeholder="Qwen/Qwen2.5-1.5B-Instruct"
@@ -97,14 +98,16 @@ export default function AuditForm({ disabled = false, note }: { disabled?: boole
       
       <button 
         type="submit" 
-        disabled={disabled || busy || value.trim() === ''} 
+        disabled={disabled || busy || value.trim() === '' || pdfReady} 
         className="btn btn-primary mt-3 w-full"
       >
         {disabled 
           ? 'Jaldi chalu hoga' 
           : progress !== null && progress < 100 
             ? `Auditing... ${progress}%` 
-            : 'Free audit chalao →'}
+            : pdfReady 
+              ? 'Audit Poora Hua! ✓' 
+              : 'Free audit chalao →'}
       </button>
 
       <p id="audit-help" className="mt-3 text-xs text-muted">
@@ -114,13 +117,26 @@ export default function AuditForm({ disabled = false, note }: { disabled?: boole
 
       {/* लाइव प्रोग्रेस स्टेटस बॉक्स - जो टर्मिनल के साथ सिंक होकर काम करेगा */}
       {progress !== null && (
-        <div className="mt-4 p-3 bg-surface border border-line rounded-lg font-mono text-xs text-ink space-y-1">
+        <div className="mt-4 p-4 bg-surface border border-line rounded-lg font-mono text-xs text-ink space-y-2">
           <p className="text-muted">// live processing data</p>
           <p>[{progress >= 20 ? '✓' : '⚙'}] Model architecture validated</p>
           <p className={progress >= 42 ? 'text-accent' : 'text-muted'}>
             [{progress >= 80 ? '✓' : '⚙'}] Hindi matrix calculations: {progress}%
           </p>
-          {progress === 100 && <p className="text-good">[✓] Report generation complete!</p>}
+          
+          {/* जादुई PDF डाउनलोड बटन: यह केवल 100% होने पर ही स्क्रीन पर प्रकट होगा */}
+          {pdfReady && (
+            <div className="mt-3 p-3 bg-good/10 border border-good rounded-md flex flex-col gap-2">
+              <p className="text-good font-sans font-semibold">✨ Sthamly NanoBrain Quality Report ready!</p>
+              <a 
+                href={`/api/pdf?model=${encodeURIComponent(value.trim())}`} 
+                download
+                className="btn btn-secondary py-2 text-center text-xs font-sans font-bold bg-green-600 text-white rounded hover:bg-green-700 transition-colors flex items-center justify-center gap-1"
+              >
+                📥 Download Hindi Audit Report (PDF)
+              </a>
+            </div>
+          )}
         </div>
       )}
 
