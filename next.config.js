@@ -7,20 +7,20 @@ const nextConfig = {
   trailingSlash: false,
   poweredByHeader: false,
 
-  // 3. GitHub Releases से SthamlyDesk.zip का सीधा और सुरक्षित डाउनलोड रीडायरेक्ट्स
+  // 3. Render.sh से SthamlyDesk.zip का असली 100% डायरेक्ट डाउनलोड रीडायरेक्ट्स
   async redirects() {
-    // स्क्रीनशॉट के अनुसार सटीक रिलीज पाथ और ज़िप फ़ाइल का नाम
-    const GITHUB_ZIP_URL = 'https://github.com';
+    // रेंडर द्वारा दिया गया आपका लाइव डायरेक्ट एसेट डाउनलोड लिंक
+    const RENDER_ZIP_URL = 'https://onrender.com';
 
     return [
       {
         source: '/download/windows',
-        destination: GITHUB_ZIP_URL, // सीधे ज़िप फ़ाइल पर भेजेगा
+        destination: RENDER_ZIP_URL,
         permanent: false, 
       },
       {
         source: '/download/mac',
-        destination: GITHUB_ZIP_URL, // सीधे ज़िप फ़ाइल पर भेजेगा
+        destination: RENDER_ZIP_URL,
         permanent: false,
       },
     ];
