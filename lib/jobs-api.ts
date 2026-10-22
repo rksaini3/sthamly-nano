@@ -14,9 +14,12 @@ export async function createAuditJob(input: string): Promise<CreateResult> {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ hf_model_identifier: model }),
     })
-    const data = await response.json()
-    if (!response.ok) return { ok: false, code: data.error || 'failed' }
-    if (!data?.id) return { ok: false, code: 'bad_response' }
+    // A proxy or crash can return HTML instead of JSON. That must not look like a network error.
+    const data = await response.json().catch(() => null)
+    if (!response.ok) {
+      return { ok: false, code: typeof data?.error === 'string' ? data.error : 'failed' }
+    }
+    if (typeof data?.id !== 'string') return { ok: false, code: 'bad_response' }
     return { ok: true, id: data.id, deduped: Boolean(data.deduped) }
   } catch {
     return { ok: false, code: 'network_error' }
@@ -31,6 +34,7 @@ export async function fetchJob(id: string): Promise<FetchResult> {
     if (response.status === 404) return { ok: true, job: null }
     if (!response.ok) return { ok: false, message: 'Data fetch karne mein dikkat hai.' }
     const job = (await response.json()) as JobData
+    if (!job || typeof job.status !== 'string') return { ok: false, message: 'Server ka jawab samajh nahi aaya.' }
     return { ok: true, job }
   } catch {
     return { ok: false, message: 'Network connection bahut hua hai.' }
