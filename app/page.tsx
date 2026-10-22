@@ -39,8 +39,9 @@ const HOW_TO_READ = [
 export default async function Home() {
   const { models, error } = await getModels()
   const contact = safeLink(process.env.NEXT_PUBLIC_CONTACT_URL)
-  
-  const auditOn = true
+
+  // Public audit sirf tab on hai jab server par PUBLIC_AUDIT_ENABLED="true" ho. Default: band.
+  const auditOn = process.env.PUBLIC_AUDIT_ENABLED === 'true'
   const hero = models?.find((m) => chartData(m) !== null)
 
   return (
@@ -72,13 +73,10 @@ export default async function Home() {
 
         <div id="audit">
           <Terminal title="sthamly · free hindi audit">
-            <AuditForm disabled={!auditOn} note={undefined} />
-            <div className="mt-5 space-y-1.5 border-t border-line pt-4 font-mono text-xs">
-              <p className="text-muted">// live progress aise dikhega</p>
-              <p className="text-good">[✓] Model Hugging Face par check</p>
-              <p className="text-ink">[⚙] Hindi test sets par FP16 se naap ... <span className="text-accent">100%</span></p>
-              <p className="whitespace-pre text-good">[✓] Result processed</p>
-            </div>
+            <AuditForm
+              disabled={!auditOn}
+              note={auditOn ? undefined : 'Public audit abhi band hai. Apna model Sthamly Desk par check karein.'}
+            />
           </Terminal>
         </div>
       </section>
@@ -91,8 +89,7 @@ export default async function Home() {
             Sthamly Desk: Vakeel, CA aur Students ke liye Offline Hindi Sahayak
           </h2>
           <p className="mt-4 text-base text-muted max-w-xl mx-auto">
-            Aapke Case PDF, Financial Ledgers aur personal chat aapke computer par hi rehte hain. Zero Cloud, Zero Data Leaks. 
-            <span className="block mt-2 text-xs font-semibold text-warn">⚠️ सुप्रीम कोर्ट 2026 गाइडलाइन के अनुसार 100% सुरक्षित।</span>
+            Aapke Case PDF, Financial Ledgers aur personal chat aapke computer par hi rehte hain. Zero Cloud, Zero Data Leaks.
           </p>
 
           {/* Cross-Platform Download Buttons */}
