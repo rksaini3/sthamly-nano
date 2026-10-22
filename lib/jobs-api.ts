@@ -9,7 +9,8 @@ export async function createAuditJob(input: string): Promise<CreateResult> {
   if (!model) return { ok: false, code: 'invalid_model' }
 
   try {
-    const response = await fetch('/api/jobs', {
+    const response = await fetch('/api/models', {
+
 
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
