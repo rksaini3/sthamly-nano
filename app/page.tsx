@@ -40,10 +40,8 @@ export default async function Home() {
   const { models, error } = await getModels()
   const contact = safeLink(process.env.NEXT_PUBLIC_CONTACT_URL)
 
-  // Public audit sirf tab on hai jab server par PUBLIC_AUDIT_ENABLED="true" ho. Default: band.
-  const auditOn = true // इसे हमेशा के लिए चालू कर दिया
-
-  const hero = models?.find((m) => chartData(m) !== null)
+  // ✅ सुधार: फ्रंटएंड को सीधे एनवायरनमेंट वेरिएबल से जोड़ दिया गया है ताकि बैकएंड और फ्रंटएंड एक साथ काम करें
+  const auditOn = process.env.PUBLIC_AUDIT_ENABLED === 'true'
 
   return (
     <Main>
@@ -72,15 +70,14 @@ export default async function Home() {
           </p>
         </div>
 
-      <div id="audit">
-  <Terminal title="sthamly · free hindi audit">
-    <AuditForm
-      disabled={!auditOn}
-      note={undefined} // यहाँ 'undefined' करने से वह लाल चेतावनी हमेशा के लिए गायब हो जाएगी
-    />
-  </Terminal>
-</div>
-
+        <div id="audit">
+          <Terminal title="sthamly · free hindi audit">
+            <AuditForm
+              disabled={!auditOn}
+              note={undefined} // यहाँ 'undefined' रखने से वह लाल चेतावनी हमेशा के लिए गायब हो जाएगी
+            />
+          </Terminal>
+        </div>
       </section>
 
       {/* BOTTOM HALF: Sthamly Workspace Hub */}
