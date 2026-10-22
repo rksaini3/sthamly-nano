@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Sthamly NanoBrain admin CLI (table `jobs`, licenses per db/schema_v3.sql).
+Sthamly NanoBrain admin CLI (tables `jobs` and `licenses`, schema db/schema_v3.sql + migration 0002).
 
     python scripts/admin.py enqueue --model owner/name            # calibrate job (full build)
     python scripts/admin.py enqueue --model owner/name --kind audit
     python scripts/admin.py jobs [--status failed] [--limit 20]
     python scripts/admin.py license --profile lawyer [--job UUID] [--max-devices 2] [--note "pilot"]
     python scripts/admin.py revoke --prompt-key                   # hidden prompt (recommended)
-    python scripts/admin.py revoke --key STH-XXXX-XXXX-XXXX-XXXX
+    python scripts/admin.py revoke --key STH-XXXX-XXXX-XXXX-XXXX  # ends up in shell history
     python scripts/admin.py revoke --hash <64-hex>
     python scripts/admin.py purge --days 90                       # remove old finished jobs
 
@@ -38,24 +38,41 @@ ADMIN_REQUESTER = "admin"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
+def find_active_duplicate(db: Supabase, model: str) -> dict[str, Any] | None:
+    """
+    A queued or running job for the same model, compared case-insensitively.
+    HF repo ids are case-insensitive, and the DB index is on lower(hf_model), so this must match it.
+    """
+    rows = db.get_rows(TABLE_JOBS, {"select": "id,status,hf_model",
+                                    "status": f"in.({','.join(JOB_ACTIVE)})"})
+    wanted = model.lower()
+    return next((r for r in rows if str(r.get("hf_model") or "").lower() == wanted), None)
+
+
 def cmd_enqueue(db: Supabase, args: argparse.Namespace) -> int:
     model = normalize_model_id(args.model)
     if model is None:
         print("Model id invalid. Use owner/name or a huggingface.co model link.")
         return 2
-    active = db.get_rows(TABLE_JOBS, {"select": "id,status", "hf_model": f"eq.{model}",
-                                      "status": f"in.({','.join(JOB_ACTIVE)})", "limit": "1"})
-    if active:
-        print(f"This model already has an active job: {active[0]['id']} ({active[0]['status']}).")
+
+    duplicate = find_active_duplicate(db, model)
+    if duplicate:
+        print(f"Ye model pehle se active hai: {duplicate['id']} ({duplicate['status']}).")
         return 1
+
     steps = [{"label": label, "state": "pending"} for label in STEP_LABELS[args.kind]]
     try:
         rows = db.insert(TABLE_JOBS, {"kind": args.kind, "hf_model": model,
                                       "requester_hash": ADMIN_REQUESTER, "status": "queued",
                                       "step": "Queued", "progress": 0, "steps": steps})
     except SupabaseError as exc:
-        print(f"Job not created: {scrub(exc, (db.key,), 300)}")
+        text = scrub(exc, (db.key,), 300)
+        if "23505" in text:
+            print("Ye model abhi kisi aur ne queue kiya hai (same time par). Jobs list dekhiye.")
+        else:
+            print(f"Job not created: {text}")
         return 1
+
     if not rows or not rows[0].get("id"):
         print("Insert not confirmed. Check the database before retrying.")
         return 1
@@ -74,7 +91,8 @@ def cmd_jobs(db: Supabase, args: argparse.Namespace) -> int:
         print("No matching job.")
         return 0
     for row in rows:
-        print(f"{row['id']}  {row['status']:<9} {row['kind']:<9} {int(row.get('progress') or 0):3d}%  {row['hf_model']}")
+        progress = int(row.get("progress") or 0)
+        print(f"{row['id']}  {row['status']:<9} {row['kind']:<9} {progress:3d}%  {row['hf_model']}")
         if row.get("error"):
             print(f"    [{scrub(row['error'], (db.key,), 200)}]")
     return 0
@@ -90,9 +108,11 @@ def cmd_license(db: Supabase, args: argparse.Namespace) -> int:
     if args.job and not valid_job_id(args.job):
         print("--job must be a UUID.")
         return 2
+
     key = generate_key()
+    note = (args.note or "").strip()[:300] or None
     record: dict[str, Any] = {"key_hash": hash_key(key), "profile": args.profile,
-                              "max_devices": args.max_devices, "note": (args.note or "")[:300] or None}
+                              "max_devices": args.max_devices, "note": note}
     if args.job:
         record["job_id"] = args.job.lower()
     try:
@@ -136,8 +156,13 @@ def cmd_revoke(db: Supabase, args: argparse.Namespace) -> int:
 
 
 def cmd_purge(db: Supabase, args: argparse.Namespace) -> int:
-    count = db.rpc("purge_old_jobs", {"retention_days": max(1, args.days)})
-    print(f"Purged {count} finished job(s) older than {args.days} days.")
+    result = db.rpc("purge_old_jobs", {"retention_days": max(1, args.days)})
+    if isinstance(result, list):
+        result = result[0] if result else None
+    if isinstance(result, int):
+        print(f"Purged {result} finished job(s) older than {args.days} days.")
+    else:
+        print(f"Purge finished (older than {args.days} days). The function returned no count.")
     return 0
 
 
