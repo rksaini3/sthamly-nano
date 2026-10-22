@@ -4,8 +4,9 @@ import { createHash } from 'crypto'
 import { normalizeModelId } from '@/lib/jobs'
 
 export const runtime = 'nodejs'
+export const dynamic = 'force-dynamic'
 
-// Keep in sync with AUDIT_STEPS in scripts/sthamly_common.py (STEP_LABELS['audit']).
+// Keep in sync with STEP_LABELS['audit'] in scripts/sthamly_common.py.
 const AUDIT_STEPS = [
   'Preflight checks',
   'Download and policy check',
@@ -16,24 +17,36 @@ const AUDIT_STEPS = [
 ]
 
 const MAX_ACTIVE_JOBS = 20          // whole queue
+const ACTIVE_SCAN_LIMIT = 500       // rows fetched to check duplicates and queue size
 const WINDOW_MS = 10 * 60 * 1000    // per requester
 const MAX_PER_WINDOW = 3
 
-// In-memory limiter. Per server instance only. For production use a shared store (e.g. Upstash).
+// In-memory limiter: per server instance only. Vercel runs many instances, so this is a
+// speed bump, not a real quota. CAPTCHA and a shared quota store are needed before public launch.
 const hits = new Map<string, number[]>()
 
 const url = process.env.NEXT_PUBLIC_SUPABASE_URL
 const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY
 const salt = process.env.REQUESTER_SALT || ''
+// Public audit queue is OFF unless explicitly enabled. Blueprint: Day-1 product is Legal Desk only.
+const publicAuditEnabled = process.env.PUBLIC_AUDIT_ENABLED === 'true'
 
 const admin =
   url && serviceKey
     ? createClient(url, serviceKey, { auth: { persistSession: false, autoRefreshToken: false } })
     : null
 
+/**
+ * The FIRST entry of x-forwarded-for is written by the client and can be anything.
+ * Each proxy appends the address it saw, so the LAST entry is the one the platform added.
+ */
 function clientIp(req: NextRequest): string {
-  const forwarded = (req.headers.get('x-forwarded-for') || '').split(',')[0].trim()
-  return forwarded || req.headers.get('x-real-ip') || 'unknown'
+  const parts = (req.headers.get('x-forwarded-for') || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+  if (parts.length > 0) return parts[parts.length - 1]
+  return req.headers.get('x-real-ip') || 'unknown'
 }
 
 function rateLimited(key: string): boolean {
@@ -48,8 +61,31 @@ function rateLimited(key: string): boolean {
   return false
 }
 
+type ActiveJob = { id: string; status: string; hf_model: string }
+
+/** All queued and running jobs. Returns error=true if the lookup failed. */
+async function activeJobs(): Promise<{ rows: ActiveJob[]; error: boolean }> {
+  if (!admin) return { rows: [], error: true }
+  const { data, error } = await admin
+    .from('jobs')
+    .select('id, status, hf_model')
+    .in('status', ['queued', 'running'])
+    .limit(ACTIVE_SCAN_LIMIT)
+  if (error) return { rows: [], error: true }
+  return { rows: (data ?? []) as ActiveJob[], error: false }
+}
+
+/** HF repo ids are case-insensitive, so the comparison is too. */
+function findActive(rows: ActiveJob[], model: string): ActiveJob | undefined {
+  const wanted = model.toLowerCase()
+  return rows.find((r) => r.hf_model.toLowerCase() === wanted)
+}
+
 export async function POST(req: NextRequest) {
-  if (!admin) {
+  if (!publicAuditEnabled) {
+    return NextResponse.json({ error: 'not_available' }, { status: 404 })
+  }
+  if (!admin || !salt) {
     return NextResponse.json({ error: 'server_not_configured' }, { status: 503 })
   }
 
@@ -71,28 +107,16 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'rate_limited' }, { status: 429 })
   }
 
-  // Same model already queued or running: return that job instead of a new one.
-  const { data: active, error: activeError } = await admin
-    .from('jobs')
-    .select('id, status')
-    .eq('hf_model', model)
-    .in('status', ['queued', 'running'])
-    .limit(1)
-  if (activeError) {
+  // Same model already queued or running: return that job instead of creating a new one.
+  const scan = await activeJobs()
+  if (scan.error) {
     return NextResponse.json({ error: 'lookup_failed' }, { status: 500 })
   }
-  if (active && active.length > 0) {
-    return NextResponse.json({ id: active[0].id, status: active[0].status, deduped: true }, { status: 200 })
+  const existing = findActive(scan.rows, model)
+  if (existing) {
+    return NextResponse.json({ id: existing.id, status: existing.status, deduped: true }, { status: 200 })
   }
-
-  const { count, error: countError } = await admin
-    .from('jobs')
-    .select('id', { count: 'exact', head: true })
-    .in('status', ['queued', 'running'])
-  if (countError) {
-    return NextResponse.json({ error: 'lookup_failed' }, { status: 500 })
-  }
-  if ((count ?? 0) >= MAX_ACTIVE_JOBS) {
+  if (scan.rows.length >= MAX_ACTIVE_JOBS) {
     return NextResponse.json({ error: 'queue_full' }, { status: 503 })
   }
 
@@ -111,7 +135,16 @@ export async function POST(req: NextRequest) {
     .single()
 
   if (error || !data) {
+    // 23505 = unique violation on jobs_one_active_model: a parallel request queued the same model first.
+    if (error?.code === '23505') {
+      const again = await activeJobs()
+      const dup = again.error ? undefined : findActive(again.rows, model)
+      if (dup) {
+        return NextResponse.json({ id: dup.id, status: dup.status, deduped: true }, { status: 200 })
+      }
+    }
     return NextResponse.json({ error: 'db_insert_failed' }, { status: 500 })
   }
+
   return NextResponse.json({ id: data.id, status: data.status, deduped: false }, { status: 201 })
 }
