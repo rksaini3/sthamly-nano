@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Sthamly Desk: user ka software. Model aur PDF dono sirf user ke computer par rehte hain.
 
-    python desk/sthamly_desk.py --check                            # kya taiyaar hai, kya kam hai
-    python desk/sthamly_desk.py --model dist/X/X-Q4_K_M-hindi60.gguf --no-license    # apne test ke liye
-    python desk/sthamly_desk.py --model path/to/model.gguf         # asli: activation key maangega
+    python desk/sthamly_desk.py --check                                     # kya taiyaar hai, kya kam hai
+    python desk/sthamly_desk.py --model path/to/model.gguf                  # asli: activation key maangega
+    STHAMLY_DEV=1 python desk/sthamly_desk.py --model X.gguf --no-license   # sirf developer ke test ke liye
 """
 from __future__ import annotations
 
@@ -18,23 +18,12 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-# Serverless integration wrappers layer fallback
-try:
-    from desk_app import Desk, make_server
-    from desk_errors import DeskError
-    from desk_llama import LlamaServer, find_llama_server
-except ImportError:
-    # Build context recovery mode for GitHub PyInstaller matrix
-    class Desk: pass
-    def make_server(*args, **kwargs): pass
-    class DeskError(Exception): pass
-    class LlamaServer:
-        def __init__(self, *args, **kwargs): pass
-        def start(self): pass
-        def stop(self): pass
-    def find_llama_server(*args): return Path(sys.executable)
+from desk_app import Desk, make_server  # noqa: E402
+from desk_errors import DeskError  # noqa: E402
+from desk_llama import LlamaServer, find_llama_server  # noqa: E402
 
 HOME = Path(os.environ.get("STHAMLY_HOME") or Path.home() / ".sthamly")
+DEV_ENV = "STHAMLY_DEV"  # sirf developer ke computer par "1" hota hai. Shipped exe par nahi.
 
 
 def load_config() -> dict:
@@ -68,6 +57,10 @@ def find_model(arg: str | None) -> Path | None:
     return None
 
 
+def dev_mode_allowed() -> bool:
+    return os.environ.get(DEV_ENV) == "1"
+
+
 def check(args: argparse.Namespace, cfg: dict) -> int:
     bad = 0
 
@@ -82,21 +75,22 @@ def check(args: argparse.Namespace, cfg: dict) -> int:
         line(True, "pypdf (PDF padhne ke liye)")
     except ImportError:
         line(False, "pypdf", "pip install pypdf")
-        
+
     server = args.llama_server or find_llama_server(HERE)
     line(bool(server), f"llama-server{': ' + str(server) if server else ''}",
          "llama.cpp build karo (bash scripts/setup.sh) ya release se llama-server download karke is folder me rakho")
-         
+
     model = find_model(args.model)
     line(bool(model), f"model (.gguf){': ' + str(model) if model else ''}",
-         "python scripts/engine.py build --model ... chalao, ya --model path/to/file.gguf do")
-         
+         "--model path/to/file.gguf do, ya model ko desk/models folder me rakho")
+
     if args.no_license:
-        print("[note] --no-license: testing mode, activation key nahi maangi jaayegi")
+        print(f"[note] --no-license: testing mode (sirf {DEV_ENV}=1 ke saath chalta hai)")
     else:
-        line(bool(cfg.get("supabase_url") and cfg.get("supabase_anon_key")), "server ka pata (Supabase URL + anon key)",
-             "desk/desk_config.example.json ko desk_config.json naam se copy karke bharo")
-             
+        line(bool(cfg.get("supabase_url") and cfg.get("supabase_anon_key")),
+             "server ka pata (Supabase URL + anon key)",
+             "desk/desk_config.json mein supabase_url aur supabase_anon_key bharo")
+
     print("\nSab taiyaar hai." if bad == 0 else f"\n{bad} cheez(en) kam hain.")
     return 0 if bad == 0 else 1
 
@@ -109,25 +103,70 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--port", type=int, default=8765, help="software ka port (default 8765)")
     ap.add_argument("--llama-port", type=int, default=8081)
     ap.add_argument("--ctx", type=int, default=4096, help="model ki yaaddasht (tokens)")
-    
-    # Hardware compliance units overhaul
-    system_cores = os.cpu_count() or 4
-    optimal_threads = max(2, min(4, system_cores // 2))
-    ap.add_argument("--threads", type=int, default=optimal_threads, help="model processing core units allocation")
-    
-    ap.add_argument("--no-license", action="store_true", help="sirf testing: activation key mat maango")
+    ap.add_argument("--threads", type=int, default=max(2, min(4, (os.cpu_count() or 4) // 2)),
+                    help="model processing threads")
+    ap.add_argument("--no-license", action="store_true", help=f"sirf developer test: {DEV_ENV}=1 chahiye")
     ap.add_argument("--no-browser", action="store_true")
     ap.add_argument("--check", action="store_true")
     args = ap.parse_args(argv)
     cfg = load_config()
-    
+
     if args.check:
         return check(args, cfg)
 
-    # Standard fallback runtime routing matrix
-    print(f"Starting Sthamly Desk Engine context on port: {args.port}")
+    dev = False
+    if args.no_license:
+        if not dev_mode_allowed():
+            print(f"--no-license sirf developer mode me chalta hai ({DEV_ENV}=1). Asli software me ye kaam nahi karta.")
+            return 2
+        dev = True
+    elif not (cfg.get("supabase_url") and cfg.get("supabase_anon_key")):
+        print("Server ka pata nahi mila (desk_config.json). Software shuru nahi ho sakta.")
+        return 1
+
+    model = find_model(args.model)
+    if model is None:
+        print("Model (.gguf) nahi mila. --model path/to/file.gguf do.")
+        return 1
+
+    llama: LlamaServer | None = None
+    if args.llama_url:
+        llama_url = args.llama_url.rstrip("/")
+    else:
+        binary = args.llama_server or find_llama_server(HERE)
+        if binary is None or not Path(binary).is_file():
+            print("llama-server nahi mila. --llama-server path do, ya llama-server ko desk folder me rakho.")
+            return 1
+        llama = LlamaServer(Path(binary), model, port=args.llama_port, ctx=args.ctx,
+                            threads=args.threads, log=HOME / "llama.log")
+        atexit.register(llama.stop)
+        print("Model load ho raha hai (pehli baar me kuch minute lag sakte hain)...", flush=True)
+        try:
+            llama.start()
+        except (DeskError, OSError) as exc:
+            print(f"Model start nahi hua: {getattr(exc, 'message', exc)}")
+            return 1
+        llama_url = llama.url
+
+    desk = Desk(cfg, llama_url, HOME, dev=dev)
+    try:
+        server = make_server(desk, args.port)
+    except OSError:
+        print(f"Port {args.port} pehle se use ho raha hai. --port se dusra port do.")
+        return 1
+
+    url = f"http://localhost:{args.port}"
+    print(f"Sthamly Desk chal raha hai: {url}\nBand karne ke liye Ctrl+C dabao.", flush=True)
     if not args.no_browser:
-        webbrowser.open(f"http://localhost:{args.port}")
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nBand ho raha hai.")
+    finally:
+        server.server_close()
+        if llama is not None:
+            llama.stop()
     return 0
 
 
