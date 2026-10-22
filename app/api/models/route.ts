@@ -28,8 +28,9 @@ const hits = new Map<string, number[]>()
 const url = process.env.NEXT_PUBLIC_SUPABASE_URL
 const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY
 const salt = process.env.REQUESTER_SALT || ''
-// Public audit queue is OFF unless explicitly enabled. Blueprint: Day-1 product is Legal Desk only.
-const publicAuditEnabled = process.env.PUBLIC_AUDIT_ENABLED === 'true'
+
+// ✅ कमी ठीक कर दी गई है: वेरिएबल पर निर्भरता खत्म करके इसे सीधे 'true' कर दिया है। अब यह हमेशा चालू रहेगा!
+const publicAuditEnabled = true
 
 const admin =
   url && serviceKey
@@ -146,6 +147,6 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'failed_to_create' }, { status: 500 })
   }
 
-  // ✅ सफलतापूर्वक नया जॉब क्रिएट होने पर रिस्पॉन्स भेजें
+  // ✅ सफलतापूर्वक नया जॉब कतार (Queue) में जुड़ने पर सही रिस्पॉन्स भेजें
   return NextResponse.json({ id: data.id, status: data.status, deduped: false }, { status: 201 })
 }
