@@ -1,41 +1,46 @@
 #!/usr/bin/env python3
 """
-Sthamly NanoBrain Worker (v2)
-=============================
+Sthamly NanoBrain Worker
+
+Processes queued calibration jobs (quantization_jobs rows with status 'pending').
 
 Commands:
     python scripts/worker.py --check
     python scripts/worker.py --once
-    python scripts/worker.py
     python scripts/worker.py --once --job-id JOB_UUID
-
-Required environment variables:
-    NEXT_PUBLIC_SUPABASE_URL
-    SUPABASE_SERVICE_ROLE_KEY
-    SUPABASE_STORAGE_BUCKET
-    HINDI_TEST_DATASET          (held-out evaluation lines, never used for calibration)
-    HINDI_CALIB_DATASET         (calibration text for the Hindi imatrix)
-
-Optional environment variables:
-    HF_COMMAND, LLAMA_CPP_CONVERTER, LLAMA_QUANTIZE, LLAMA_IMATRIX
-    NANOBRAIN_RUNNING_STATUS    (status name used while a job runs; default "extracting")
-    NANOBRAIN_KEEP_FILES        ("true" to keep local work files)
-
-Required tools:
-    Python, Hugging Face CLI (`hf`), llama.cpp: convert_hf_to_gguf.py,
-    llama-quantize, llama-imatrix, scripts/audit.py
+    python scripts/worker.py                         # poll forever
 
 Pipeline per job:
-    preflight -> download -> FP16 GGUF -> Hindi imatrix -> standard Q4_K_M
-    -> Hindi-imatrix Q4_K_M -> audit -> upload -> save result
+    0  Preflight        tools, datasets (calibration != test), storage bucket, disk
+    1  Download         prepare_model.prepare(): commit-pinned download, license/size/custom-code policy
+    2  Convert          FP16 GGUF (prepare_model)
+    3  Hindi imatrix    llama-imatrix on the Hindi calibration file
+    4  Plain Q4_K_M     from the same FP16 (prepare_model)
+    5  Hindi Q4_K_M     from the same FP16 + imatrix
+    6  Audit            scripts/audit.py -> reports/<slug>/report.json (status must be 'complete')
+    7  Upload           Supabase Storage: quants, imatrix, report (FP16 only if UPLOAD_FP16=true)
+    8  Save             job row -> completed, result built from the validated report
 
-The worker never invents metrics. A job is marked completed only after
-real artifacts, a valid audit report, and successful storage uploads.
+Environment:
+    NEXT_PUBLIC_SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_STORAGE_BUCKET   (required)
+    HF_TOKEN                                  (gated or private models)
+    ALLOW_LICENSES, MAX_MODEL_GB              (policy, read by prepare_model)
+    HINDI_CALIB_DATASET, HINDI_TEST_DATASET   (defaults: data/hindi_calib.txt, data/hindi_test.txt)
+    LLAMA_CPP_DIR, LLAMA_CPP_CONVERTER, LLAMA_QUANTIZE, LLAMA_IMATRIX
+    IMATRIX_CHUNKS, IMATRIX_THREADS, IMATRIX_TIMEOUT, QUANT_TIMEOUT, AUDIT_TIMEOUT
+    WORKER_MIN_FREE_GB                        (default 15)
+    UPLOAD_FP16                               ("true" to upload the FP16 GGUF too)
+
+Rules:
+    - Never invents a metric. Numbers in the job row come from reports/<slug>/report.json.
+    - Completed only after a complete audit report, all uploads, and a successful final update.
+    - Artifacts stay in models/gguf so a re-run reuses them. Only the HF snapshot is cleaned.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -49,215 +54,184 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import deque
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
 
-sys.path.insert(0, str(HERE))
-
-RUNNING_STATUS = os.getenv("NANOBRAIN_RUNNING_STATUS", "extracting")
-
-PROGRESS = [5, 10, 25, 35, 50, 65, 80, 90, 97]
-
-AUDIT_STEPS = [
-    "Preflight checks",
-    "Download Hugging Face model",
-    "Convert model to FP16 GGUF",
-    "Build Hindi imatrix",
-    "Quantize standard Q4_K_M",
-    "Quantize Hindi-imatrix Q4_K_M",
-    "Run audit and validate report",
-    "Upload artifacts",
-    "Save results",
-]
+import prepare_model as pm  # noqa: E402  (download, FP16, plain Q4, policy, locks)
+from audit import report_directory_name  # noqa: E402
+from sthamly_common import (  # noqa: E402
+    STATUS_COMPLETED,
+    STATUS_FAILED,
+    STATUS_PENDING,
+    STATUS_RUNNING,
+    STEP_LABELS,
+    TABLE_JOBS,
+    UPLOAD_TIMEOUT,
+    Supabase,
+    SupabaseError,
+    normalize_model_id,
+    scrub,
+    validate_job_id,
+)
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-@dataclass
-class Config:
-    root: Path = ROOT
+HINDI_CALIB = Path(os.getenv("HINDI_CALIB_DATASET", str(ROOT / "data" / "hindi_calib.txt")))
+HINDI_TEST = Path(os.getenv("HINDI_TEST_DATASET", str(ROOT / "data" / "hindi_test.txt")))
+IMATRIX_BIN = Path(os.getenv("LLAMA_IMATRIX", str(pm.LLAMA_DIR / "build" / "bin" / "llama-imatrix")))
+AUDIT_SCRIPT = HERE / "audit.py"
 
-    poll_seconds: int = 15
-    request_timeout: int = 30
-    upload_timeout: int = 3600
-    heartbeat_seconds: int = 60
-    stale_minutes: int = 45
+IMATRIX_CHUNKS = int(os.getenv("IMATRIX_CHUNKS", "60"))
+IMATRIX_THREADS = int(os.getenv("IMATRIX_THREADS", str(max(1, min(os.cpu_count() or 2, 8)))))
+IMATRIX_TIMEOUT = int(os.getenv("IMATRIX_TIMEOUT", "7200"))
+QUANT_TIMEOUT = int(os.getenv("QUANT_TIMEOUT", "3600"))
+AUDIT_TIMEOUT = int(os.getenv("AUDIT_TIMEOUT", "10800"))
 
-    min_free_gb: float = 15.0
-    max_weights_gb: float = 4.2
-    threads: int = max(1, min(os.cpu_count() or 2, 8))
+MIN_FREE_GB = float(os.getenv("WORKER_MIN_FREE_GB", "15"))
+UPLOAD_FP16 = os.getenv("UPLOAD_FP16", "false").strip().lower() == "true"
+POLL_SECONDS = 15
+HEARTBEAT_SECONDS = 60
+STALE_MINUTES = 45
 
-    prepare_timeout: int = 3600
-    audit_timeout: int = 10800
+# Indexes into STEP_LABELS (sthamly_common). Keep in the same order.
+STEP_PREFLIGHT = 0
+STEP_DOWNLOAD = 1
+STEP_CONVERT = 2
+STEP_IMATRIX = 3
+STEP_PLAIN_Q4 = 4
+STEP_HINDI_Q4 = 5
+STEP_AUDIT = 6
+STEP_UPLOAD = 7
+STEP_SAVE = 8
 
-    keep_files: bool = (
-        os.getenv("NANOBRAIN_KEEP_FILES", "false").lower() == "true"
-    )
-
-    @property
-    def work_dir(self) -> Path:
-        return self.root / "work"
-
-    @property
-    def test_dataset(self) -> Path:
-        return Path(
-            os.getenv("HINDI_TEST_DATASET", str(self.root / "data" / "hindi-test.txt"))
-        )
-
-    @property
-    def calib_dataset(self) -> Path:
-        return Path(
-            os.getenv("HINDI_CALIB_DATASET", str(self.root / "data" / "hindi-calib.txt"))
-        )
-
-    @property
-    def supabase_url(self) -> str:
-        return os.getenv("NEXT_PUBLIC_SUPABASE_URL", "").strip().rstrip("/")
-
-    @property
-    def supabase_key(self) -> str:
-        return os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
-
-    @property
-    def storage_bucket(self) -> str:
-        return os.getenv("SUPABASE_STORAGE_BUCKET", "").strip()
-
-    @property
-    def hf_command(self) -> str:
-        return os.getenv("HF_COMMAND", "hf")
-
-    @property
-    def converter(self) -> Path:
-        return Path(
-            os.getenv(
-                "LLAMA_CPP_CONVERTER",
-                str(self.root / "llama.cpp" / "convert_hf_to_gguf.py"),
-            )
-        )
-
-    @property
-    def quantize_command(self) -> str:
-        return os.getenv("LLAMA_QUANTIZE", "llama-quantize")
-
-    @property
-    def imatrix_command(self) -> str:
-        return os.getenv("LLAMA_IMATRIX", "llama-imatrix")
-
-    @property
-    def audit_script(self) -> Path:
-        return self.root / "scripts" / "audit.py"
-
-
-CFG = Config()
+STEP_PROGRESS = {0: 5, 1: 10, 2: 25, 3: 72, 4: 70, 5: 80, 6: 88, 7: 94, 8: 98}
 
 
 # ============================================================
-# ERRORS
+# ERRORS AND SMALL HELPERS
 # ============================================================
 
-class WorkerError(Exception):
-    """Expected processing or configuration failure."""
+class JobError(Exception):
+    """A pipeline step failed. The message is scrubbed and stored in error_note."""
 
-
-class SupabaseError(WorkerError):
-    """Database or storage request failed."""
-
-
-class Refused(WorkerError):
-    """Job rejected because its input or environment is unsupported."""
-
-
-# ============================================================
-# HELPERS
-# ============================================================
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def safe_text(value: Any, limit: int = 500) -> str:
-    """Single-line, length-limited text for DB fields and short messages."""
-    text = re.sub(r"[\r\n\t]+", " ", str(value or ""))
-    return text[:limit]
-
-
-def tail(value: Any, limit: int = 600) -> str:
-    """Last N characters. Errors usually appear at the END of tool output."""
-    return str(value or "")[-limit:]
-
-
-def safe_model_name(model_id: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", model_id.strip()).strip("._-")
-    if not cleaned:
-        raise Refused("Invalid model identifier.")
-    return cleaned[:120]
-
-
-def find_tool(name: str) -> str | None:
-    path = Path(name)
-    if path.is_file():
-        return str(path.resolve())
-    return shutil.which(name)
-
-
-def require_file(path: Path, description: str) -> Path:
-    if not path.is_file():
-        raise WorkerError(f"{description} not found: {path}")
-    if path.stat().st_size <= 0:
-        raise WorkerError(f"{description} is empty: {path}")
-    return path
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def file_size_gb(path: Path) -> float:
-    return round(path.stat().st_size / (1024 ** 3), 4)
+    return round(path.stat().st_size / 1e9, 4)
+
+
+def is_fresh(target: Path, *sources: Path) -> bool:
+    """True if target exists, is non-empty, and is not older than any of its inputs."""
+    if not target.is_file() or target.stat().st_size == 0:
+        return False
+    return all(target.stat().st_mtime >= src.stat().st_mtime for src in sources)
 
 
 def free_gb(path: Path) -> float:
-    p = path
-    while not p.exists() and p != p.parent:
-        p = p.parent
-    return round(shutil.disk_usage(p).free / (1024 ** 3), 2)
+    path.mkdir(parents=True, exist_ok=True)
+    return shutil.disk_usage(path).free / 1e9
 
 
-def run_command(command: list[Any], timeout: int, cwd: Path | None = None) -> str:
-    """
-    Run a real command, stream its output live, and return the output.
-    Raises WorkerError on timeout or non-zero exit. Never hides a failure.
-    """
+def parse_model_id(job: dict[str, Any]) -> str:
+    raw = str(job.get("hf_model_identifier") or "").strip()
+    if not raw:
+        raise JobError("Job has no hf_model_identifier.")
+    # URL-level check first: normalize_model_id would turn huggingface.co/datasets/a/b into datasets/a.
+    if re.search(r"huggingface\.co/(datasets|spaces)/", raw, re.IGNORECASE):
+        raise JobError("Only model repos are accepted; dataset and space URLs are refused.")
+    model_id = normalize_model_id(raw)
+    if model_id is None:
+        raise JobError("Invalid model ID. Use owner/name or a huggingface.co model URL.")
+    return model_id
+
+
+def config_problems() -> list[str]:
+    """Every missing tool or input, as plain text. An empty list means ready."""
+    problems: list[str] = []
+
+    if not pm.CONVERT.is_file():
+        problems.append(f"GGUF converter not found: {pm.CONVERT}")
+    if not pm.QUANTIZE.is_file():
+        problems.append(f"llama-quantize not found: {pm.QUANTIZE}")
+    if not IMATRIX_BIN.is_file():
+        problems.append(f"llama-imatrix not found: {IMATRIX_BIN}")
+    if not AUDIT_SCRIPT.is_file():
+        problems.append(f"audit.py not found: {AUDIT_SCRIPT}")
+
+    for label, path in (("calibration", HINDI_CALIB), ("test", HINDI_TEST)):
+        if not path.is_file() or path.stat().st_size == 0:
+            problems.append(f"Hindi {label} file missing or empty: {path}")
+
+    if not os.getenv("SUPABASE_STORAGE_BUCKET", "").strip():
+        problems.append("SUPABASE_STORAGE_BUCKET is not set")
+
+    # Same text in calibration and test would make the Hindi comparison meaningless.
+    if not problems and file_sha256(HINDI_CALIB) == file_sha256(HINDI_TEST):
+        problems.append("Calibration and test files are identical (leakage).")
+
+    return problems
+
+
+def preflight() -> None:
+    problems = config_problems()
+    free = free_gb(pm.GGUF_DIR)
+    if free < MIN_FREE_GB:
+        problems.append(f"free disk {free:.1f} GB; need at least {MIN_FREE_GB:g} GB")
+    if problems:
+        raise JobError("Preflight failed: " + "; ".join(problems))
+
+
+# ============================================================
+# SUBPROCESS WITH TIMEOUT
+# ============================================================
+
+def run(command: list[Any], timeout: int, label: str) -> None:
+    """Run a real command with live output and a hard timeout. Raises JobError on any failure."""
     cmd = [str(part) for part in command]
-    print("\n$ " + " ".join(cmd), flush=True)
+    print(f"\n$ {' '.join(cmd)}", flush=True)
 
     try:
         proc = subprocess.Popen(
             cmd,
-            cwd=str(cwd) if cwd else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
         )
     except OSError as exc:
-        raise WorkerError(f"Could not execute command: {exc}") from exc
+        raise JobError(f"{label}: could not start ({exc}).") from exc
 
-    killed = threading.Event()
+    recent: deque[str] = deque(maxlen=60)
+    timed_out = threading.Event()
 
-    def _kill() -> None:
-        killed.set()
+    def kill_process() -> None:
+        timed_out.set()
         proc.kill()
 
-    timer = threading.Timer(timeout, _kill)
+    timer = threading.Timer(timeout, kill_process)
     timer.start()
-
-    recent: deque[str] = deque(maxlen=200)
-
     try:
         assert proc.stdout is not None
         for line in proc.stdout:
@@ -265,838 +239,589 @@ def run_command(command: list[Any], timeout: int, cwd: Path | None = None) -> st
             print(line, flush=True)
             recent.append(line)
         proc.wait()
-    except BaseException:
-        # Ctrl+C or unexpected error: do not leave an orphaned llama.cpp process.
-        proc.kill()
-        raise
     finally:
         timer.cancel()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
 
-    output = "\n".join(recent)
-
-    if killed.is_set():
-        raise WorkerError(
-            f"Command timed out after {timeout} seconds. Last output: {tail(output)}"
-        )
-
+    if timed_out.is_set():
+        raise JobError(f"{label}: timed out after {timeout} seconds.")
     if proc.returncode != 0:
-        raise WorkerError(
-            f"Command failed with exit code {proc.returncode}: {tail(output)}"
-        )
-
-    return output
+        last = " | ".join(recent)[-400:]
+        raise JobError(f"{label}: exit code {proc.returncode}. Last output: {last}")
 
 
 # ============================================================
-# SUPABASE REST + STORAGE CLIENT
+# SUPABASE: STORAGE UPLOAD
 # ============================================================
 
-class Supabase:
-    """
-    Minimal PostgREST + Storage client.
-    Uses the service-role key on the worker machine only.
-    Never expose this key to browser/client-side code.
-    """
+def upload(db: Supabase, local: Path, obj: str, content_type: str) -> None:
+    """Streams one file to Supabase Storage. The file is never fully loaded into RAM."""
+    bucket = os.getenv("SUPABASE_STORAGE_BUCKET", "").strip()
+    if not bucket:
+        raise JobError("SUPABASE_STORAGE_BUCKET is not set.")
+    if not local.is_file() or local.stat().st_size == 0:
+        raise JobError(f"Upload source missing or empty: {local.name}")
 
-    def __init__(self) -> None:
-        self.url = CFG.supabase_url
-        self.key = CFG.supabase_key
+    bucket_q = urllib.parse.quote(bucket, safe="")
+    object_q = "/".join(urllib.parse.quote(part, safe="") for part in obj.split("/"))
+    url = f"{db.url}/storage/v1/object/{bucket_q}/{object_q}"
 
-    def check_config(self) -> None:
-        if not self.url:
-            raise SupabaseError("NEXT_PUBLIC_SUPABASE_URL is missing.")
-        if not self.url.startswith("https://"):
-            raise SupabaseError("Supabase URL must use HTTPS.")
-        if not self.key:
-            raise SupabaseError("SUPABASE_SERVICE_ROLE_KEY is missing.")
-
-    def _json_request(
-        self,
-        method: str,
-        path: str,
-        payload: Any = None,
-        prefer: str | None = None,
-    ) -> bytes:
-        self.check_config()
-
-        headers = {
-            "apikey": self.key,
-            "Authorization": f"Bearer {self.key}",
-        }
-        if payload is not None:
-            headers["Content-Type"] = "application/json"
-        if prefer:
-            headers["Prefer"] = prefer
-
-        body = json.dumps(payload).encode("utf-8") if payload is not None else None
-
+    with local.open("rb") as handle:
         req = urllib.request.Request(
-            self.url + path, data=body, headers=headers, method=method
+            url,
+            data=handle,
+            headers={
+                "apikey": db.key,
+                "Authorization": f"Bearer {db.key}",
+                "Content-Type": content_type,
+                "Content-Length": str(local.stat().st_size),
+                "x-upsert": "true",
+            },
+            method="POST",
         )
-
         try:
-            with urllib.request.urlopen(req, timeout=CFG.request_timeout) as response:
-                return response.read()
+            with urllib.request.urlopen(req, timeout=UPLOAD_TIMEOUT) as response:
+                response.read()
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            raise SupabaseError(
-                f"Supabase HTTP {exc.code}: {safe_text(detail, 500)}"
+            raise JobError(
+                f"Upload of {local.name} failed: HTTP {exc.code} "
+                f"{scrub(detail, extra_secrets=(db.key,), limit=200)}"
             ) from exc
         except (urllib.error.URLError, TimeoutError) as exc:
-            raise SupabaseError(
-                f"Supabase connection failed: {safe_text(exc, 300)}"
+            raise JobError(
+                f"Upload of {local.name} failed: {scrub(exc, extra_secrets=(db.key,), limit=200)}"
             ) from exc
 
-    def _json_list(self, raw: bytes) -> list[dict[str, Any]]:
+
+# ============================================================
+# AUDIT REPORT VALIDATION
+# ============================================================
+
+def validate_audit_report(report: Any) -> dict[str, dict[str, Any]]:
+    """
+    Accepts only a complete, schema-2 audit report with finite KLD numbers for both
+    variants on the 'hindi' test set. Returns {variant: result_item}.
+    """
+    if not isinstance(report, dict):
+        raise JobError("Audit report is not a JSON object.")
+    if report.get("schema_version") != 2:
+        raise JobError(f"Audit report schema_version {report.get('schema_version')!r} is not 2.")
+    if report.get("status") != "complete":
+        raise JobError(f"Audit report status is {report.get('status')!r}; only 'complete' is accepted.")
+
+    results = report.get("results")
+    if not isinstance(results, list) or not results:
+        raise JobError("Audit report has no results.")
+
+    picked: dict[str, dict[str, Any]] = {}
+    for item in results:
+        if not isinstance(item, dict):
+            raise JobError("Audit report has a malformed result row.")
+        if item.get("domain") != "hindi":
+            continue
+        variant = item.get("variant")
+        if variant not in ("q4_standard", "q4_hindi"):
+            continue
+        for key in ("kld", "kld_error"):
+            value = item.get(key)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0
+            ):
+                raise JobError(f"Audit report: invalid {key} for {variant}: {value!r}")
+        picked[variant] = item
+
+    missing = {"q4_standard", "q4_hindi"} - set(picked)
+    if missing:
+        raise JobError(f"Audit report is missing results for: {', '.join(sorted(missing))}")
+    return picked
+
+
+def variant_summary(item: dict[str, Any]) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "domain": item.get("domain"),
+        "kld": item["kld"],
+        "kld_error": item["kld_error"],
+    }
+    for key in ("rms", "rms_error", "same_top_p", "same_top_p_error"):
+        if key in item:
+            summary[key] = item[key]
+    return summary
+
+
+# ============================================================
+# JOB ROW: PROGRESS, FAILURE, COMPLETION
+# ============================================================
+
+class JobRecorder:
+    """Writes this job's progress to its own row. Every write is guarded by status = running."""
+
+    def __init__(self, db: Supabase, job_id: str) -> None:
+        self.db = db
+        self.job_id = job_id
+        self.steps = [{"label": label, "state": "pending"} for label in STEP_LABELS]
+        self.progress = 1
+
+    def _patch(self, fields: dict[str, Any]) -> list[dict[str, Any]]:
+        fields = {**fields, "heartbeat_at": now_iso()}
+        return self.db.patch_job_by_id(self.job_id, fields, only_if_status=STATUS_RUNNING)
+
+    def sync(self, step: str | None = None) -> None:
+        fields: dict[str, Any] = {"steps": self.steps, "progress": self.progress}
+        if step:
+            fields["step"] = step
         try:
-            result = json.loads(raw.decode("utf-8"))
-        except json.JSONDecodeError as exc:
-            raise SupabaseError("Supabase returned invalid JSON.") from exc
-        if not isinstance(result, list):
-            raise SupabaseError("Expected a JSON array from Supabase.")
-        return result
+            rows = self._patch(fields)
+        except SupabaseError as exc:
+            # A telemetry failure must not stop the build. Completion is checked separately.
+            print(f"WARNING: progress update failed: {scrub(exc, limit=200)}", flush=True)
+            return
+        if not rows:
+            raise JobError("Job is no longer running (reclaimed or changed elsewhere); stopping.")
 
-    def get_rows(self, table: str, query: dict[str, str]) -> list[dict[str, Any]]:
-        qs = urllib.parse.urlencode(query)
-        raw = self._json_request("GET", f"/rest/v1/{table}?{qs}")
-        return self._json_list(raw)
+    def start(self, index: int) -> None:
+        self.steps[index]["state"] = "running"
+        self.progress = max(self.progress, STEP_PROGRESS[index])
+        label = STEP_LABELS[index]
+        print(f"\n[{index + 1}/{len(STEP_LABELS)}] {label}", flush=True)
+        self.sync(label)
 
-    def patch_job(
-        self,
-        job_id: str,
-        fields: dict[str, Any],
-        only_if_status: str | None = None,
-    ) -> list[dict[str, Any]]:
-        """
-        Conditional PATCH. Returned rows show whether the update matched.
-        Empty list means the job was not in the expected status.
-        """
-        query: dict[str, str] = {"id": f"eq.{job_id}", "select": "id,status"}
-        if only_if_status:
-            query["status"] = f"eq.{only_if_status}"
+    def done(self, *indices: int) -> None:
+        for index in indices:
+            self.steps[index]["state"] = "done"
+        self.sync()
 
-        qs = urllib.parse.urlencode(query)
-        raw = self._json_request(
-            "PATCH",
-            f"/rest/v1/quantization_jobs?{qs}",
-            payload=fields,
-            prefer="return=representation",
-        )
-        return self._json_list(raw)
+    def requeue(self, reason: str) -> None:
+        """Put the job back in the queue (for example, when the model is locked by another job)."""
+        try:
+            self.db.patch_job_by_id(
+                self.job_id,
+                {"status": STATUS_PENDING, "step": reason, "progress": 0, "heartbeat_at": now_iso()},
+                only_if_status=STATUS_RUNNING,
+            )
+        except SupabaseError as exc:
+            print(f"WARNING: could not requeue job: {scrub(exc, limit=200)}", flush=True)
 
-    def fetch_pending_jobs(self, limit: int = 10) -> list[dict[str, Any]]:
-        return self.get_rows(
-            "quantization_jobs",
+    def fail(self, message: str) -> None:
+        for step in self.steps:
+            if step["state"] == "running":
+                step["state"] = "failed"
+        text = scrub(message, extra_secrets=(self.db.key,), limit=400)
+        try:
+            rows = self.db.patch_job_by_id(
+                self.job_id,
+                {
+                    "status": STATUS_FAILED,
+                    "step": "Failed",
+                    "steps": self.steps,
+                    "error_note": text,
+                    "heartbeat_at": now_iso(),
+                },
+                only_if_status=STATUS_RUNNING,
+            )
+            if not rows:
+                print("WARNING: job was not running; failure not recorded.", flush=True)
+        except SupabaseError as exc:
+            print(f"CRITICAL: could not record failure: {scrub(exc, limit=200)}", flush=True)
+        print(f"\nJOB FAILED: {text}", flush=True)
+
+    def complete(self, result: dict[str, Any]) -> None:
+        for step in self.steps:
+            step["state"] = "done"
+        rows = self.db.patch_job_by_id(
+            self.job_id,
             {
-                "select": "*",
-                "status": "eq.pending",
-                "order": "created_at.asc",
-                "limit": str(limit),
-            },
-        )
-
-    def claim_job(self, job: dict[str, Any]) -> dict[str, Any] | None:
-        """
-        Claim only if still pending. Two workers cannot both win this PATCH.
-        For very high volume, a PostgreSQL RPC with FOR UPDATE SKIP LOCKED
-        is the stronger option.
-        """
-        job_id = str(job.get("id", "")).strip()
-        if not job_id:
-            raise WorkerError("Pending job has no ID.")
-
-        rows = self.patch_job(
-            job_id,
-            {
-                "status": RUNNING_STATUS,
-                "step": "Claiming job",
+                "status": STATUS_COMPLETED,
+                "steps": self.steps,
+                "progress": 100,
+                "step": "Completed",
+                "result": result,
+                "error_note": None,
                 "heartbeat_at": now_iso(),
-                "progress": 1,
             },
-            only_if_status="pending",
+            only_if_status=STATUS_RUNNING,
         )
         if not rows:
-            return None
-
-        claimed = dict(job)
-        claimed["status"] = RUNNING_STATUS
-        return claimed
-
-    def upload_file(self, local_path: Path, object_path: str, content_type: str) -> str:
-        """
-        Streaming upload. The file is read in chunks, never fully loaded into RAM.
-
-        Note: Supabase has a default upload size limit (lower on free plans).
-        Check your project's limit before uploading multi-GB files. For larger
-        files, switch to the TUS resumable upload endpoint.
-        """
-        if not CFG.storage_bucket:
-            raise SupabaseError("SUPABASE_STORAGE_BUCKET is missing.")
-
-        self.check_config()
-        require_file(local_path, "Upload artifact")
-
-        bucket = urllib.parse.quote(CFG.storage_bucket, safe="")
-        obj = "/".join(
-            urllib.parse.quote(seg, safe="")
-            for seg in object_path.lstrip("/").split("/")
-        )
-        url = f"{self.url}/storage/v1/object/{bucket}/{obj}"
-
-        with local_path.open("rb") as fh:
-            req = urllib.request.Request(
-                url,
-                data=fh,
-                headers={
-                    "apikey": self.key,
-                    "Authorization": f"Bearer {self.key}",
-                    "Content-Type": content_type,
-                    "Content-Length": str(local_path.stat().st_size),
-                    "x-upsert": "true",
-                },
-                method="POST",
+            raise JobError(
+                "Final update matched no running job. Artifacts were uploaded, "
+                "but the job was not marked completed."
             )
-            try:
-                with urllib.request.urlopen(req, timeout=CFG.upload_timeout) as response:
-                    response.read()
-            except urllib.error.HTTPError as exc:
-                detail = exc.read().decode("utf-8", errors="replace")
-                raise SupabaseError(
-                    f"Storage upload failed (HTTP {exc.code}): {safe_text(detail, 300)}"
-                ) from exc
-            except (urllib.error.URLError, TimeoutError) as exc:
-                raise SupabaseError(
-                    f"Storage upload failed: {safe_text(exc, 300)}"
-                ) from exc
-
-        return object_path
+        print("\nSUCCESS: build, audit, uploads and final update completed.", flush=True)
 
 
-# ============================================================
-# HEARTBEAT + STALE JOB RECOVERY
-# ============================================================
+class PrepareProgress:
+    """prepare_model reports (status, progress, step). Store those on the job row."""
+
+    def __init__(self, rec: JobRecorder) -> None:
+        self.rec = rec
+
+    def update(self, status: str | None = None, progress: int | None = None,
+               step: str | None = None) -> None:
+        if progress is not None:
+            # prepare_model covers steps 1-4, so keep its progress below the imatrix step.
+            self.rec.progress = max(self.rec.progress, min(int(progress), 70))
+        self.rec.sync(step)
+
 
 class Heartbeat(threading.Thread):
-    """
-    Updates heartbeat_at in the background while a long step (download,
-    conversion, audit) runs. Without this, a healthy job looks stale.
-    """
+    """Keeps heartbeat_at fresh during long steps so the reaper does not kill a healthy job."""
 
-    def __init__(self, db: Supabase, job_id: str, every: int) -> None:
+    def __init__(self, db: Supabase, job_id: str) -> None:
         super().__init__(daemon=True)
         self.db = db
         self.job_id = job_id
-        self.every = every
         self.stop_event = threading.Event()
 
     def run(self) -> None:
-        while not self.stop_event.wait(self.every):
+        while not self.stop_event.wait(HEARTBEAT_SECONDS):
             try:
-                self.db.patch_job(self.job_id, {"heartbeat_at": now_iso()})
+                self.db.patch_job_by_id(
+                    self.job_id,
+                    {"heartbeat_at": now_iso()},
+                    only_if_status=STATUS_RUNNING,
+                )
             except SupabaseError as exc:
-                print(f"WARNING: heartbeat failed: {safe_text(exc, 200)}", flush=True)
+                print(f"WARNING: heartbeat failed: {scrub(exc, limit=200)}", flush=True)
+
+
+# ============================================================
+# BUILD PIPELINE
+# ============================================================
+
+def run_build(db: Supabase, rec: JobRecorder, model_id: str, name: str) -> None:
+    hf_token = os.getenv("HF_TOKEN", "").strip() or None
+    allowed = {
+        item.strip().lower()
+        for item in os.getenv("ALLOW_LICENSES", pm.DEFAULT_ALLOWED_LICENSES).split(",")
+        if item.strip()
+    }
+
+    # Steps 1, 2 and 4 happen inside prepare(): commit-pinned download with policy checks,
+    # FP16 GGUF, and the plain Q4_K_M built from that same FP16.
+    rec.start(STEP_DOWNLOAD)
+    prep = pm.prepare(
+        model_id,
+        hf_token,
+        PrepareProgress(rec),
+        allowed_licenses=allowed,
+        check_license=True,
+        max_gb=pm.DEFAULT_MAX_GB,
+        cleanup_hf=True,
+    )
+    rec.done(STEP_DOWNLOAD, STEP_CONVERT, STEP_PLAIN_Q4)
+
+    fp16 = Path(prep["fp16_path"])
+    plain_q4 = Path(prep["standard_q4_path"])
+    imatrix = pm.GGUF_DIR / f"{name}.hindi.imatrix"
+    hindi_q4 = pm.GGUF_DIR / f"{name}-Q4_K_M-hindi.gguf"
+
+    # Step 3: Hindi imatrix. Rebuilt whenever the FP16 is newer than it.
+    rec.start(STEP_IMATRIX)
+    if not is_fresh(imatrix, fp16):
+        hindi_q4.unlink(missing_ok=True)  # a Q4 built from an old imatrix is stale too
+        pm.build_atomic(
+            imatrix,
+            lambda part: run(
+                [IMATRIX_BIN, "-m", fp16, "-f", HINDI_CALIB, "-o", part,
+                 "--chunks", IMATRIX_CHUNKS, "-t", IMATRIX_THREADS],
+                IMATRIX_TIMEOUT,
+                "llama-imatrix",
+            ),
+        )
+    else:
+        print("  Hindi imatrix is up to date, reusing it.", flush=True)
+    rec.done(STEP_IMATRIX)
+
+    # Step 5: Hindi-imatrix Q4_K_M from the same FP16.
+    rec.start(STEP_HINDI_Q4)
+    if not is_fresh(hindi_q4, fp16, imatrix):
+        pm.build_atomic(
+            hindi_q4,
+            lambda part: run(
+                [pm.QUANTIZE, "--imatrix", imatrix, fp16, part, "Q4_K_M"],
+                QUANT_TIMEOUT,
+                "llama-quantize (Hindi)",
+            ),
+        )
+    else:
+        print("  Hindi Q4_K_M is up to date, reusing it.", flush=True)
+    rec.done(STEP_HINDI_Q4)
+
+    # Step 6: real audit. The old report is deleted first, so a stale one can never pass.
+    rec.start(STEP_AUDIT)
+    report_dir = ROOT / "reports" / report_directory_name(model_id)
+    report_path = report_dir / "report.json"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report_path.unlink(missing_ok=True)
+
+    run(
+        [
+            sys.executable, AUDIT_SCRIPT,
+            "--name", model_id,
+            "--fp16", fp16,
+            "--dataset", f"hindi={HINDI_TEST}",
+            "--quant", f"q4_standard={plain_q4}",
+            "--quant", f"q4_hindi={hindi_q4}",
+            "--calibration", HINDI_CALIB,
+            "--out", report_path,
+        ],
+        AUDIT_TIMEOUT,
+        "audit.py",
+    )
+
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise JobError(f"Audit report could not be read: {exc}") from exc
+    picked = validate_audit_report(report)
+    rec.done(STEP_AUDIT)
+
+    # Step 7: uploads. On failure the local files stay, so a retry does not rebuild everything.
+    rec.start(STEP_UPLOAD)
+    prefix = f"jobs/{rec.job_id}/{name}"
+    items: list[tuple[str, Path, str]] = [
+        ("quantized_standard", plain_q4, "application/octet-stream"),
+        ("quantized_hindi", hindi_q4, "application/octet-stream"),
+        ("imatrix", imatrix, "application/octet-stream"),
+        ("report", report_path, "application/json"),
+    ]
+    if UPLOAD_FP16:
+        items.insert(0, ("fp16", fp16, "application/octet-stream"))
+
+    objects: dict[str, str] = {}
+    for key, local, content_type in items:
+        obj = f"{prefix}/{local.name}"
+        upload(db, local, obj, content_type)
+        objects[key] = obj
+    rec.done(STEP_UPLOAD)
+
+    # Step 8: save. Every number comes from the validated report.
+    rec.start(STEP_SAVE)
+    result = {
+        "model_id": model_id,
+        "job_id": rec.job_id,
+        "commit_sha": prep["commit_sha"],
+        "license": prep["license"],
+        "weights_gb": prep["weights_gb"],
+        "audit": {
+            "schema_version": report.get("schema_version"),
+            "timestamp": report.get("timestamp"),
+            "settings": report.get("settings"),
+            "warnings": report.get("audit_warnings", []),
+            "comparisons": report.get("comparisons", []),
+        },
+        "variants": {variant: variant_summary(item) for variant, item in picked.items()},
+        "sizes_gb": {
+            "fp16": file_size_gb(fp16),
+            "quantized_standard": file_size_gb(plain_q4),
+            "quantized_hindi": file_size_gb(hindi_q4),
+        },
+        "artifacts": {"bucket": os.getenv("SUPABASE_STORAGE_BUCKET", "").strip(), **objects},
+        "generated_at": now_iso(),
+    }
+    rec.complete(result)
+
+
+# ============================================================
+# JOB LIFECYCLE
+# ============================================================
+
+def process_job(db: Supabase, job: dict[str, Any]) -> str:
+    """Runs one claimed job. Returns 'completed', 'failed', or 'requeued'."""
+    job_id = validate_job_id(str(job.get("id", "")))
+    rec = JobRecorder(db, job_id)
+    heartbeat = Heartbeat(db, job_id)
+    heartbeat.start()
+
+    try:
+        model_id = parse_model_id(job)
+        name = model_id.replace("/", "__")
+
+        rec.start(STEP_PREFLIGHT)
+        preflight()
+        rec.done(STEP_PREFLIGHT)
+
+        # One lock for the whole build of this model. prepare_model uses <name>.lock
+        # internally, so this lock uses <name>.job.lock to avoid a self-deadlock.
+        with pm.model_lock(f"{name}.job"):
+            run_build(db, rec, model_id, name)
+        return "completed"
+
+    except pm.PrepareError as exc:
+        if exc.code == pm.EXIT_BUSY:
+            rec.requeue("Waiting: another job is building this model")
+            print("Model is busy; job put back in the queue.", flush=True)
+            return "requeued"
+        rec.fail(str(exc))
+        return "failed"
+
+    except JobError as exc:
+        rec.fail(str(exc))
+        return "failed"
+
+    except Exception as exc:
+        rec.fail(f"{type(exc).__name__}: {exc}")
+        return "failed"
+
+    except KeyboardInterrupt:
+        rec.fail("Stopped by operator (KeyboardInterrupt).")
+        raise
+
+    finally:
+        heartbeat.stop_event.set()
+
+
+def claim(db: Supabase, job: dict[str, Any]) -> str | None:
+    """Atomically move one pending job to running. Returns its id if this worker won."""
+    job_id = validate_job_id(str(job.get("id", "")))
+    rows = db.patch_job_by_id(
+        job_id,
+        {"status": STATUS_RUNNING, "step": "Claimed", "progress": 1, "heartbeat_at": now_iso()},
+        only_if_status=STATUS_PENDING,
+    )
+    return job_id if rows else None
 
 
 def reap_stale_jobs(db: Supabase) -> None:
-    """
-    Mark jobs as failed if their worker died (heartbeat too old).
-    Only touches jobs still in the running status.
-    """
-    cutoff = (
-        datetime.now(timezone.utc) - timedelta(minutes=CFG.stale_minutes)
-    ).isoformat()
-
+    """Fail jobs whose worker died. Only rows still in the running status are touched."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=STALE_MINUTES)).isoformat()
     stale = db.get_rows(
-        "quantization_jobs",
+        TABLE_JOBS,
         {
             "select": "id",
-            "status": f"eq.{RUNNING_STATUS}",
+            "status": f"eq.{STATUS_RUNNING}",
             "heartbeat_at": f"lt.{cutoff}",
+            "limit": "50",
         },
     )
-
     for row in stale:
-        job_id = str(row.get("id", ""))
-        if not job_id:
+        try:
+            job_id = validate_job_id(str(row.get("id", "")))
+        except ValueError:
             continue
-        db.patch_job(
+        rows = db.patch_job_by_id(
             job_id,
             {
-                "status": "failed",
+                "status": STATUS_FAILED,
                 "step": "Failed",
                 "error_note": "Worker heartbeat timed out; job reclaimed as failed.",
                 "heartbeat_at": now_iso(),
             },
-            only_if_status=RUNNING_STATUS,
+            only_if_status=STATUS_RUNNING,
         )
-        print(f"Reaped stale job {job_id}", flush=True)
+        if rows:
+            print(f"Reaped stale job {job_id}", flush=True)
 
-
-# ============================================================
-# JOB STATE / TELEMETRY
-# ============================================================
-
-class JobState:
-    def __init__(self, db: Supabase, job_id: str) -> None:
-        self.db = db
-        self.job_id = job_id
-        self.steps = [{"label": label, "state": "pending"} for label in AUDIT_STEPS]
-        self.progress = 1
-
-    def _push(self, extra: dict[str, Any] | None = None) -> None:
-        fields: dict[str, Any] = {
-            "steps": self.steps,
-            "progress": self.progress,
-            "heartbeat_at": now_iso(),
-        }
-        if extra:
-            fields.update(extra)
-
-        try:
-            self.db.patch_job(self.job_id, fields, only_if_status=RUNNING_STATUS)
-        except SupabaseError as exc:
-            # Telemetry failure must not fake success. The final update is checked.
-            print(f"WARNING: telemetry update failed: {safe_text(exc, 200)}", flush=True)
-
-    def start(self, index: int) -> None:
-        for i in range(index):
-            self.steps[i]["state"] = "done"
-        self.steps[index]["state"] = "running"
-        self.progress = PROGRESS[index]
-
-        label = self.steps[index]["label"]
-        print(f"\n[{index + 1}/{len(self.steps)}] {label}", flush=True)
-        self._push({"step": label})
-
-    def done(self, index: int) -> None:
-        self.steps[index]["state"] = "done"
-        self._push()
-
-    def complete(self, report: dict[str, Any], artifacts: dict[str, str]) -> None:
-        for item in self.steps:
-            item["state"] = "done"
-
-        report["artifacts"] = artifacts
-
-        rows = self.db.patch_job(
-            self.job_id,
-            {
-                "status": "completed",
-                "steps": self.steps,
-                "progress": 100,
-                "step": "Completed",
-                "heartbeat_at": now_iso(),
-                "result": report,
-            },
-            only_if_status=RUNNING_STATUS,
-        )
-        if not rows:
-            raise SupabaseError(
-                "Final status update matched no running job. Check whether "
-                "another process changed the status, or whether the schema "
-                "uses different status names (NANOBRAIN_RUNNING_STATUS)."
-            )
-
-        self.progress = 100
-        print("\nSUCCESS: Real processing and final DB update completed.", flush=True)
-
-    def fail(self, error: BaseException) -> None:
-        for item in self.steps:
-            if item["state"] == "running":
-                item["state"] = "failed"
-
-        message = safe_text(f"{type(error).__name__}: {error}", 400)
-
-        try:
-            rows = self.db.patch_job(
-                self.job_id,
-                {
-                    "status": "failed",
-                    "steps": self.steps,
-                    "step": "Failed",
-                    "error_note": message,
-                    "heartbeat_at": now_iso(),
-                },
-                only_if_status=RUNNING_STATUS,
-            )
-            if not rows:
-                print("WARNING: job was not running; failure not recorded.", flush=True)
-        except Exception as db_error:
-            print(
-                f"CRITICAL: could not record job failure: {safe_text(db_error, 300)}",
-                flush=True,
-            )
-
-        print(f"\nJOB FAILED: {message}", flush=True)
-
-
-# ============================================================
-# CHECKS (used by --check and by per-job preflight)
-# ============================================================
-
-def _check(ok: bool, label: str) -> tuple[bool, str]:
-    return ok, label
-
-
-def collect_checks(db: Supabase) -> list[tuple[bool, str]]:
-    results: list[tuple[bool, str]] = []
-
-    try:
-        db.check_config()
-        results.append((True, "Supabase URL and service-role key configured"))
-        db.get_rows("quantization_jobs", {"select": "id", "limit": "1"})
-        results.append((True, "Supabase reachable and quantization_jobs readable"))
-    except SupabaseError as exc:
-        results.append((False, str(exc)))
-
-    results.append(_check(bool(find_tool(CFG.hf_command)), f"Hugging Face CLI: {CFG.hf_command}"))
-    results.append(_check(CFG.converter.is_file(), f"GGUF converter: {CFG.converter}"))
-    results.append(_check(bool(find_tool(CFG.quantize_command)), f"llama-quantize: {CFG.quantize_command}"))
-    results.append(_check(bool(find_tool(CFG.imatrix_command)), f"llama-imatrix: {CFG.imatrix_command}"))
-    results.append(_check(CFG.audit_script.is_file(), f"Audit script: {CFG.audit_script}"))
-    results.append(_check(
-        CFG.test_dataset.is_file() and CFG.test_dataset.stat().st_size > 0,
-        f"Hindi test dataset: {CFG.test_dataset}",
-    ))
-    results.append(_check(
-        CFG.calib_dataset.is_file() and CFG.calib_dataset.stat().st_size > 0,
-        f"Hindi calibration dataset: {CFG.calib_dataset}",
-    ))
-    results.append(_check(
-        CFG.calib_dataset.resolve() != CFG.test_dataset.resolve(),
-        "Calibration and test datasets are different files (no leakage)",
-    ))
-    results.append(_check(bool(CFG.storage_bucket), f"Storage bucket: {CFG.storage_bucket or 'MISSING'}"))
-
-    free = free_gb(CFG.work_dir)
-    results.append(_check(
-        free >= CFG.min_free_gb,
-        f"Free disk {free} GB (required >= {CFG.min_free_gb} GB)",
-    ))
-
-    return results
-
-
-def check_environment(db: Supabase) -> int:
-    print("\n=== STHAMLY NANOBRAIN WORKER CHECK ===\n")
-    results = collect_checks(db)
-    failures = 0
-    for ok, label in results:
-        print(("OK:   " if ok else "FAIL: ") + label)
-        if not ok:
-            failures += 1
-
-    print(f"\nPython: {sys.version.split()[0]}")
-    print(f"Project root: {CFG.root}")
-    print(f"Threads: {CFG.threads}")
-
-    if failures:
-        print(f"\nCHECK FAILED: {failures} issue(s) found.")
-        return 1
-
-    print("\nCHECK PASSED.")
-    print(
-        "Note: this does not prove that a full conversion, audit, or upload "
-        "will succeed on this machine's hardware."
-    )
-    return 0
-
-
-def preflight(db: Supabase) -> None:
-    """Run before any download. Fail fast instead of after 3 GB of work."""
-    failed = [label for ok, label in collect_checks(db) if not ok]
-    if failed:
-        raise Refused("Preflight failed: " + "; ".join(safe_text(f, 200) for f in failed))
-
-
-# ============================================================
-# MODEL VALIDATION AND PROCESSING
-# ============================================================
-
-def validate_model_id(job: dict[str, Any]) -> str:
-    model_id = str(
-        job.get("hf_model_identifier") or job.get("hf_model") or ""
-    ).strip()
-
-    if not model_id:
-        raise Refused("Job is missing hf_model_identifier.")
-
-    if not re.fullmatch(
-        r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*",
-        model_id,
-    ):
-        raise Refused("Model ID must use namespace/model format.")
-
-    return model_id
-
-
-def validate_job_id(job_id: str) -> str:
-    if not re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", job_id):
-        raise Refused("Job ID must be a UUID.")
-    return job_id
-
-
-def download_model(model_id: str, destination: Path) -> Path:
-    hf = find_tool(CFG.hf_command)
-    if not hf:
-        raise WorkerError("Hugging Face CLI is not installed.")
-
-    destination.mkdir(parents=True, exist_ok=True)
-
-    # List-form command: no shell, so model_id cannot inject commands.
-    run_command(
-        [hf, "download", model_id, "--local-dir", destination],
-        timeout=CFG.prepare_timeout,
-    )
-
-    if not any(destination.iterdir()):
-        raise WorkerError("Hugging Face download directory is empty.")
-
-    return destination
-
-
-def convert_to_fp16(model_dir: Path, fp16_path: Path) -> Path:
-    if not CFG.converter.is_file():
-        raise WorkerError(f"Converter script not found: {CFG.converter}")
-
-    fp16_path.parent.mkdir(parents=True, exist_ok=True)
-
-    run_command(
-        [
-            sys.executable, CFG.converter, model_dir,
-            "--outfile", fp16_path,
-            "--outtype", "f16",
-        ],
-        timeout=CFG.prepare_timeout,
-    )
-
-    require_file(fp16_path, "FP16 GGUF artifact")
-
-    size_gb = file_size_gb(fp16_path)
-    if size_gb > CFG.max_weights_gb:
-        raise Refused(
-            f"FP16 GGUF is {size_gb} GB; configured maximum is "
-            f"{CFG.max_weights_gb} GB. Raise the limit only after checking disk."
-        )
-
-    return fp16_path
-
-
-def build_hindi_imatrix(fp16_path: Path, calib_path: Path, out_path: Path) -> Path:
-    """
-    The core of the NanoBrain bet: an importance matrix computed from Hindi
-    calibration text. Without this step, the "Hindi-calibrated" quant
-    does not exist.
-    """
-    imatrix = find_tool(CFG.imatrix_command)
-    if not imatrix:
-        raise WorkerError("llama-imatrix binary was not found.")
-
-    require_file(calib_path, "Hindi calibration dataset")
-
-    run_command(
-        [
-            imatrix,
-            "-m", fp16_path,
-            "-f", calib_path,
-            "-o", out_path,
-            "-t", CFG.threads,
-        ],
-        timeout=CFG.prepare_timeout,
-    )
-
-    require_file(out_path, "Hindi imatrix")
-    return out_path
-
-
-def quantize_model(
-    fp16_path: Path,
-    quant_path: Path,
-    imatrix_path: Path | None = None,
-) -> Path:
-    quantizer = find_tool(CFG.quantize_command)
-    if not quantizer:
-        raise WorkerError("llama-quantize binary was not found.")
-
-    quant_path.parent.mkdir(parents=True, exist_ok=True)
-
-    command: list[Any] = [quantizer]
-    if imatrix_path is not None:
-        command += ["--imatrix", imatrix_path]
-    command += [fp16_path, quant_path, "Q4_K_M"]
-
-    run_command(command, timeout=CFG.prepare_timeout)
-
-    require_file(quant_path, "Q4_K_M GGUF artifact")
-    return quant_path
-
-
-def validate_audit_report(report: dict[str, Any]) -> None:
-    results = report.get("results")
-    if not isinstance(results, list) or not results:
-        raise WorkerError("Audit report: results missing or empty.")
-
-    for item in results:
-        if not isinstance(item, dict):
-            raise WorkerError("Audit report: malformed result row.")
-
-        kld = item.get("kld")
-        if (
-            isinstance(kld, bool)
-            or not isinstance(kld, (int, float))
-            or not math.isfinite(kld)
-            or kld < 0
-        ):
-            raise WorkerError(f"Audit report: invalid KLD value {kld!r}.")
-
-
-def run_audit(
-    model_id: str,
-    fp16_path: Path,
-    std_quant: Path,
-    hindi_quant: Path,
-    report_dir: Path,
-) -> Path:
-    """
-    Calls scripts/audit.py. The audit must accept the labels below and write
-    report.json to --out. No metrics are generated by this worker.
-    """
-    require_file(CFG.audit_script, "Audit script")
-    report_dir.mkdir(parents=True, exist_ok=True)
-    report_path = report_dir / "report.json"
-
-    run_command(
-        [
-            sys.executable, CFG.audit_script,
-            "--name", model_id,
-            "--fp16", fp16_path,
-            "--dataset", f"hindi={CFG.test_dataset}",
-            "--quant", f"q4_standard={std_quant}",
-            "--quant", f"q4_hindi={hindi_quant}",
-            "--out", report_path,
-        ],
-        timeout=CFG.audit_timeout,
-        cwd=CFG.root,
-    )
-
-    if not report_path.is_file():
-        raise WorkerError(f"Audit finished but report.json is missing: {report_path}")
-
-    try:
-        report = json.loads(report_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise WorkerError("Audit report is unreadable or invalid JSON.") from exc
-
-    if not isinstance(report, dict):
-        raise WorkerError("Audit report must be a JSON object.")
-
-    validate_audit_report(report)
-    return report_path
-
-
-# ============================================================
-# FULL JOB PIPELINE
-# ============================================================
-
-def process_job(job: dict[str, Any], db: Supabase) -> None:
-    job_id = validate_job_id(str(job.get("id", "")).strip())
-
-    state = JobState(db, job_id)
-    job_dir = CFG.work_dir / job_id
-    hb = Heartbeat(db, job_id, CFG.heartbeat_seconds)
-    hb.start()
-
-    try:
-        # ---- 0. Preflight -------------------------------------------------
-        state.start(0)
-        model_id = validate_model_id(job)
-        preflight(db)
-        slug = safe_model_name(model_id)
-
-        model_dir = job_dir / "hf-model"
-        art_dir = job_dir / "artifacts"
-        report_dir = job_dir / "report"
-        art_dir.mkdir(parents=True, exist_ok=True)
-        state.done(0)
-
-        # ---- 1. Download -------------------------------------------------
-        state.start(1)
-        download_model(model_id, model_dir)
-        state.done(1)
-
-        # ---- 2. FP16 GGUF -------------------------------------------------
-        state.start(2)
-        fp16_path = art_dir / f"{slug}-f16.gguf"
-        convert_to_fp16(model_dir, fp16_path)
-        # HF source weights are no longer needed; free the disk now.
-        shutil.rmtree(model_dir, ignore_errors=True)
-        state.done(2)
-
-        # ---- 3. Hindi imatrix ----------------------------------------------
-        state.start(3)
-        imatrix_path = build_hindi_imatrix(
-            fp16_path,
-            CFG.calib_dataset,
-            art_dir / f"{slug}-hindi.imatrix",
-        )
-        state.done(3)
-
-        # ---- 4. Standard Q4_K_M (baseline, no imatrix) ---------------------
-        state.start(4)
-        std_path = quantize_model(
-            fp16_path,
-            art_dir / f"{slug}-Q4_K_M-standard.gguf",
-        )
-        state.done(4)
-
-        # ---- 5. Hindi-imatrix Q4_K_M ---------------------------------------
-        state.start(5)
-        hindi_path = quantize_model(
-            fp16_path,
-            art_dir / f"{slug}-Q4_K_M-hindi.gguf",
-            imatrix_path=imatrix_path,
-        )
-        state.done(5)
-
-        # ---- 6. Audit ------------------------------------------------------
-        state.start(6)
-        report_path = run_audit(model_id, fp16_path, std_path, hindi_path, report_dir)
-        report = json.loads(report_path.read_text(encoding="utf-8"))
-        state.done(6)
-
-        # ---- 7. Upload -----------------------------------------------------
-        state.start(7)
-        prefix = f"jobs/{job_id}/{slug}"
-        objects = {
-            "fp16_object": (fp16_path, f"{prefix}/{fp16_path.name}", "application/octet-stream"),
-            "quantized_standard_object": (std_path, f"{prefix}/{std_path.name}", "application/octet-stream"),
-            "quantized_hindi_object": (hindi_path, f"{prefix}/{hindi_path.name}", "application/octet-stream"),
-            "imatrix_object": (imatrix_path, f"{prefix}/{imatrix_path.name}", "application/octet-stream"),
-            "report_object": (report_path, f"{prefix}/report.json", "application/json"),
-        }
-
-        artifact_paths: dict[str, str] = {"storage_bucket": CFG.storage_bucket}
-        for key, (local, obj, ctype) in objects.items():
-            db.upload_file(local, obj, ctype)
-            artifact_paths[key] = obj
-        state.done(7)
-
-        # ---- 8. Save results ----------------------------------------------
-        state.start(8)
-        report["model_id"] = model_id
-        report["job_id"] = job_id
-        report["generated_at"] = now_iso()
-        report["quantization"] = {
-            "standard": "Q4_K_M without imatrix",
-            "hindi": "Q4_K_M with Hindi imatrix",
-            "calibration_file": CFG.calib_dataset.name,
-            "test_file": CFG.test_dataset.name,
-        }
-        report["artifacts_metadata"] = {
-            "fp16_size_gb": file_size_gb(fp16_path),
-            "quantized_standard_size_gb": file_size_gb(std_path),
-            "quantized_hindi_size_gb": file_size_gb(hindi_path),
-        }
-
-        state.complete(report, artifact_paths)
-
-    except BaseException as exc:
-        state.fail(exc)
-        raise
-
-    finally:
-        hb.stop_event.set()
-        if not CFG.keep_files:
-            shutil.rmtree(job_dir, ignore_errors=True)
-
-
-# ============================================================
-# WORKER LOOP
-# ============================================================
 
 def run_once(db: Supabase, requested_job_id: str | None = None) -> str:
-    """
-    Process at most one job.
-    Returns "completed", "failed", or "idle".
-    """
+    """Process at most one job. Returns 'completed', 'failed', 'requeued', or 'idle'."""
     if requested_job_id:
+        job_id = validate_job_id(requested_job_id)
         rows = db.get_rows(
-            "quantization_jobs",
+            TABLE_JOBS,
+            {"select": "*", "id": f"eq.{job_id}", "status": f"eq.{STATUS_PENDING}", "limit": "1"},
+        )
+        if not rows:
+            print(f"Job {job_id} is not pending (missing, running, or finished).", flush=True)
+            return "idle"
+    else:
+        rows = db.get_rows(
+            TABLE_JOBS,
             {
                 "select": "*",
-                "id": f"eq.{validate_job_id(requested_job_id)}",
-                "status": "eq.pending",
-                "limit": "1",
+                "status": f"eq.{STATUS_PENDING}",
+                "order": "created_at.asc",
+                "limit": "10",
             },
         )
-    else:
-        rows = db.fetch_pending_jobs(limit=10)
+        if not rows:
+            print("No pending job.", flush=True)
+            return "idle"
 
-    if not rows:
-        print("No pending job found.", flush=True)
-        return "idle"
-
-    for candidate in rows:
-        claimed = db.claim_job(candidate)
-        if claimed is None:
-            print(
-                f"Job {candidate.get('id')} was claimed by another worker; trying next.",
-                flush=True,
-            )
+    for row in rows:
+        if claim(db, row) is None:
+            print(f"Job {row.get('id')} was claimed by another worker; trying the next one.", flush=True)
             continue
+        return process_job(db, row)
 
-        try:
-            process_job(claimed, db)
-            return "completed"
-        except Exception:
-            # process_job already recorded the failure and printed it.
-            return "failed"
-
-    print("No job could be claimed.", flush=True)
     return "idle"
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Sthamly NanoBrain Worker")
-    parser.add_argument("--check", action="store_true", help="Check configuration and tools.")
-    parser.add_argument("--once", action="store_true", help="Attempt at most one job and exit.")
-    parser.add_argument("--job-id", default=None, help="Process a specific pending job UUID (requires --once).")
-    parser.add_argument(
-        "--poll-seconds", type=int, default=CFG.poll_seconds,
-        help="Queue polling interval in seconds (3-300).",
-    )
-    args = parser.parse_args()
+# ============================================================
+# CHECK COMMAND
+# ============================================================
 
-    db = Supabase()
-
-    if args.check:
-        return check_environment(db)
+def cmd_check(db: Supabase) -> int:
+    print("\n=== STHAMLY NANOBRAIN WORKER CHECK ===\n")
+    problems: list[str] = []
 
     try:
-        db.check_config()
+        db.get_rows(TABLE_JOBS, {"select": "id", "limit": "1"})
     except SupabaseError as exc:
-        print(f"Configuration error: {exc}", file=sys.stderr)
-        return 2
+        problems.append(f"Supabase: {scrub(exc, extra_secrets=(db.key,), limit=200)}")
+
+    problems += config_problems()
+
+    free = free_gb(pm.GGUF_DIR)
+    if free < MIN_FREE_GB:
+        problems.append(f"free disk {free:.1f} GB; need at least {MIN_FREE_GB:g} GB")
+
+    if problems:
+        for problem in problems:
+            print(f"FAIL: {problem}")
+        print(f"\nCHECK FAILED: {len(problems)} issue(s).")
+        return 1
+
+    print("CHECK PASSED: config, tools, datasets, Supabase and disk look ready.")
+    print("This does not prove that a full model build will succeed on this machine.")
+    return 0
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Sthamly NanoBrain worker")
+    parser.add_argument("--check", action="store_true", help="Check config, tools and Supabase, then exit.")
+    parser.add_argument("--once", action="store_true", help="Process at most one job, then exit.")
+    parser.add_argument("--job-id", default=None, help="Process this pending job UUID (use with --once).")
+    parser.add_argument("--poll-seconds", type=int, default=POLL_SECONDS,
+                        help="Polling interval in seconds (3-300).")
+    args = parser.parse_args()
 
     if args.job_id and not args.once:
         parser.error("--job-id requires --once.")
 
+    try:
+        db = Supabase.from_env()
+    except SupabaseError as exc:
+        print(f"Configuration error: {scrub(exc, limit=300)}", file=sys.stderr)
+        return 1 if args.check else 2
+
+    if args.check:
+        return cmd_check(db)
+
     if args.once or args.job_id:
         try:
             reap_stale_jobs(db)
-            outcome = run_once(db, requested_job_id=args.job_id)
-        except Exception as exc:
-            print(f"Worker error: {safe_text(exc, 400)}", file=sys.stderr)
+            outcome = run_once(db, args.job_id)
+        except (SupabaseError, ValueError) as exc:
+            print(f"Worker error: {scrub(exc, extra_secrets=(db.key,), limit=300)}", file=sys.stderr)
             return 1
+        print(f"Outcome: {outcome}", flush=True)
         return 1 if outcome == "failed" else 0
 
-    poll_seconds = max(3, min(300, args.poll_seconds))
-
+    poll = max(3, min(300, args.poll_seconds))
     print(
         "STHAMLY NANOBRAIN WORKER STARTED\n"
-        f"Project: {CFG.root}\n"
-        f"Queue polling: every {poll_seconds} seconds\n"
-        "Press Ctrl+C to stop.",
+        f"Project: {ROOT}\n"
+        f"Polling every {poll} seconds. Press Ctrl+C to stop.",
         flush=True,
     )
 
@@ -1107,11 +832,16 @@ def main() -> int:
         except KeyboardInterrupt:
             print("\nWorker stopped by user.", flush=True)
             return 0
+        except (SupabaseError, ValueError) as exc:
+            print(f"Polling error: {scrub(exc, extra_secrets=(db.key,), limit=300)}",
+                  file=sys.stderr, flush=True)
         except Exception as exc:
-            print(f"Queue polling error: {safe_text(exc, 400)}", file=sys.stderr, flush=True)
+            print(f"Unexpected worker error: {type(exc).__name__}: "
+                  f"{scrub(exc, extra_secrets=(db.key,), limit=300)}",
+                  file=sys.stderr, flush=True)
 
         try:
-            time.sleep(poll_seconds)
+            time.sleep(poll)
         except KeyboardInterrupt:
             print("\nWorker stopped by user.", flush=True)
             return 0
