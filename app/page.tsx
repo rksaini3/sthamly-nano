@@ -41,7 +41,8 @@ export default async function Home() {
   const contact = safeLink(process.env.NEXT_PUBLIC_CONTACT_URL)
 
   // Public audit sirf tab on hai jab server par PUBLIC_AUDIT_ENABLED="true" ho. Default: band.
-  const auditOn = process.env.PUBLIC_AUDIT_ENABLED === 'true'
+  const auditOn = true // इसे हमेशा के लिए चालू कर दिया
+
   const hero = models?.find((m) => chartData(m) !== null)
 
   return (
