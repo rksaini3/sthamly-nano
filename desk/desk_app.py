@@ -9,6 +9,7 @@ import base64
 import binascii
 import json
 import secrets
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Iterator
@@ -22,6 +23,9 @@ from desk_ui import PAGE
 
 MAX_BODY = int(MAX_PDF_BYTES * 1.4) + 4096  # base64 me PDF ~33% badi hoti hai
 HISTORY_TURNS = 6
+LICENSE_TTL = 30.0  # seconds. Har API call par license file ya server nahi maangte.
+READ_ONLY_MESSAGE = ("Online jaanch ki muddat nikal gayi hai. Ab sirf purane dastavez dekh aur export kar sakte ho. "
+                     "Internet jodkar software dobara kholo.")
 
 
 class Desk:
@@ -30,15 +34,32 @@ class Desk:
         self.token = secrets.token_urlsafe(24)
         self.docs = DocStore()
         self.licenses = LicenseStore(home, cfg, dev=dev)
+        self._lic_cache: tuple[float, dict[str, Any] | None] | None = None
 
     # ---- license
     def license(self) -> dict[str, Any] | None:
-        return self.licenses.current()
+        now = time.time()
+        if self._lic_cache is not None and now - self._lic_cache[0] < LICENSE_TTL:
+            return self._lic_cache[1]
+        lic = self.licenses.current()
+        self._lic_cache = (now, lic)
+        return lic
+
+    def forget_license(self) -> None:
+        """Activate ya revoke ke baad agle call par naya haal lo."""
+        self._lic_cache = None
 
     def require_license(self) -> dict[str, Any]:
         lic = self.license()
         if not lic:
             raise DeskError("locked", "Pehle activation key daalo.", 403)
+        return lic
+
+    def require_full_license(self) -> dict[str, Any]:
+        """Naya kaam (chat, PDF jodna) sirf poori license par. read_only mein sirf dekhna aur export chalta hai."""
+        lic = self.require_license()
+        if lic.get("read_only"):
+            raise DeskError("read_only", READ_ONLY_MESSAGE, 403)
         return lic
 
     # ---- state
@@ -48,7 +69,7 @@ class Desk:
 
     # ---- documents
     def add_pdf(self, name: str, b64: str) -> dict[str, Any]:
-        self.require_license()
+        self.require_full_license()
         try:
             data = base64.b64decode(b64, validate=True)
         except (binascii.Error, ValueError):
@@ -57,39 +78,37 @@ class Desk:
 
     # ---- chat
     def build_messages(self, message: str, action: str, history: Any) -> list[dict[str, str]]:
-        lic = self.require_license()
+        lic = self.require_full_license()
         message = (message or "").strip()[:4000]
-        
+
         if action:
             task = desk_prompts.action_prompt(action)
             profile = lic.get("profile") or "general"
-            
-            # --- CHAMELEON LOGIC VALIDATION UPGRADE ---
-            # Enforce that actions are mapped accurately based on profile tokens safely
+
+            # Action sirf usi profile ke liye jo license par allowed hai.
             if task is None:
                 raise DeskError("bad_action", "Ye button algorithm array me nahi mila.")
-            
-            # Profile wise boundary lockdown to prevent token leaking between variants
+
             if profile == "lawyer" and action not in ["draft_bail", "draft_notice", "extract_ratios"] and not self.dev:
                 raise DeskError("bad_action", "Ye legal shortcut is license par allowed nahi hai.")
             elif profile == "finance" and action not in ["balance_analysis", "statement_summary"] and not self.dev:
                 raise DeskError("bad_action", "Ye finance shortcut is license par allowed nahi hai.")
-                
+
             question = task + (f"\n\nUser ki extra baat: {message}" if message else "")
         else:
             if not message:
                 raise DeskError("empty", "Pehle kuch likho.")
             question = message
-            
+
         context = self.docs.context(question)
         if action and not context:
             raise DeskError("need_pdf", "Pehle PDF jodo, phir ye button dabao.")
-            
+
         turns: list[dict[str, str]] = []
         for h in (history if isinstance(history, list) else [])[-HISTORY_TURNS:]:
             if isinstance(h, dict) and h.get("role") in ("user", "assistant") and isinstance(h.get("content"), str):
                 turns.append({"role": h["role"], "content": h["content"][:4000]})
-                
+
         user = f"DOCUMENTS:\n{context}\n\nTASK:\n{question}" if context else question
         return [{"role": "system", "content": desk_prompts.system_prompt(lic.get("profile") or "general")},
                 *turns, {"role": "user", "content": user}]
@@ -166,6 +185,7 @@ def make_server(desk: Desk, port: int = 8765) -> ThreadingHTTPServer:
                 body = self._body()
                 if self.path == "/api/activate":
                     lic = desk.licenses.activate(str(body.get("key", "")))
+                    desk.forget_license()
                     return self._json(200, {"license": lic})
                 if self.path == "/api/upload":
                     return self._json(200, desk.add_pdf(str(body.get("name", "")), str(body.get("data", ""))))
