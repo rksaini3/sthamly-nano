@@ -72,14 +72,15 @@ export default async function Home() {
           </p>
         </div>
 
-        <div id="audit">
-          <Terminal title="sthamly · free hindi audit">
-            <AuditForm
-              disabled={!auditOn}
-              note={auditOn ? undefined : 'Public audit abhi band hai. Apna model Sthamly Desk par check karein.'}
-            />
-          </Terminal>
-        </div>
+      <div id="audit">
+  <Terminal title="sthamly · free hindi audit">
+    <AuditForm
+      disabled={!auditOn}
+      note={undefined} // यहाँ 'undefined' करने से वह लाल चेतावनी हमेशा के लिए गायब हो जाएगी
+    />
+  </Terminal>
+</div>
+
       </section>
 
       {/* BOTTOM HALF: Sthamly Workspace Hub */}
