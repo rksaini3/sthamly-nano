@@ -29,13 +29,24 @@ const url = process.env.NEXT_PUBLIC_SUPABASE_URL
 const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY
 const salt = process.env.REQUESTER_SALT || ''
 
-// ✅ कमी ठीक कर दी गई है: वेरिएबल पर निर्भरता खत्म करके इसे सीधे 'true' कर दिया है। अब यह हमेशा चालू रहेगा!
+// Public audit is on. Set to false to close the public form.
 const publicAuditEnabled = true
 
 const admin =
   url && serviceKey
     ? createClient(url, serviceKey, { auth: { persistSession: false, autoRefreshToken: false } })
     : null
+
+type Detail = { message?: string; code?: string } | null | undefined
+
+/**
+ * Logs the real reason on the server (visible in Vercel Runtime Logs) and returns a short code to the browser.
+ * Never log keys, the salt, or raw IPs here.
+ */
+function fail(code: string, status: number, where: string, detail?: Detail) {
+  console.error(`[api/models] ${where} -> ${code}`, detail?.code ?? '', (detail?.message ?? '').slice(0, 300))
+  return NextResponse.json({ error: code }, { status })
+}
 
 /**
  * The FIRST entry of x-forwarded-for is written by the client and can be anything.
@@ -64,16 +75,16 @@ function rateLimited(key: string): boolean {
 
 type ActiveJob = { id: string; status: string; hf_model: string }
 
-/** All queued and running jobs. Returns error=true if the lookup failed. */
-async function activeJobs(): Promise<{ rows: ActiveJob[]; error: boolean }> {
-  if (!admin) return { rows: [], error: true }
+/** All queued and running jobs. Returns the error if the lookup failed. */
+async function activeJobs(): Promise<{ rows: ActiveJob[]; error: Detail }> {
+  if (!admin) return { rows: [], error: { message: 'no admin client' } }
   const { data, error } = await admin
     .from('jobs')
     .select('id, status, hf_model')
     .in('status', ['queued', 'running'])
     .limit(ACTIVE_SCAN_LIMIT)
-  if (error) return { rows: [], error: true }
-  return { rows: (data ?? []) as ActiveJob[], error: false }
+  if (error) return { rows: [], error }
+  return { rows: (data ?? []) as ActiveJob[], error: null }
 }
 
 /** HF repo ids are case-insensitive, so the comparison is too. */
@@ -86,8 +97,11 @@ export async function POST(req: NextRequest) {
   if (!publicAuditEnabled) {
     return NextResponse.json({ error: 'not_available' }, { status: 404 })
   }
-  if (!admin || !salt) {
-    return NextResponse.json({ error: 'server_not_configured' }, { status: 503 })
+  if (!admin) {
+    return fail('server_not_configured', 503, 'config: NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing')
+  }
+  if (!salt) {
+    return fail('server_not_configured', 503, 'config: REQUESTER_SALT missing')
   }
 
   let body: any
@@ -111,7 +125,7 @@ export async function POST(req: NextRequest) {
   // Same model already queued or running: return that job instead of creating a new one.
   const scan = await activeJobs()
   if (scan.error) {
-    return NextResponse.json({ error: 'lookup_failed' }, { status: 500 })
+    return fail('lookup_failed', 500, 'select jobs (active)', scan.error)
   }
   const existing = findActive(scan.rows, model)
   if (existing) {
@@ -144,9 +158,8 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ id: dup.id, status: dup.status, deduped: true }, { status: 200 })
       }
     }
-    return NextResponse.json({ error: 'failed_to_create' }, { status: 500 })
+    return fail('failed_to_create', 500, 'insert jobs', error ?? { message: 'insert returned no row' })
   }
 
-  // ✅ सफलतापूर्वक नया जॉब कतार (Queue) में जुड़ने पर सही रिस्पॉन्स भेजें
   return NextResponse.json({ id: data.id, status: data.status, deduped: false }, { status: 201 })
 }
