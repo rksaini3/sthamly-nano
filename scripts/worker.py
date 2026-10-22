@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Sthamly NanoBrain Worker (Option A: table `jobs`, schema db/schema_v3.sql + 0002 migration)
+Sthamly NanoBrain Worker (table `jobs`, schema db/schema_v3.sql + migration 0002)
 
 Commands:
     python scripts/worker.py --check
@@ -26,7 +26,6 @@ import hashlib
 import json
 import math
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -47,6 +46,7 @@ if str(HERE) not in sys.path:
 
 import prepare_model as pm  # noqa: E402  download, policy, FP16, plain Q4, lock, atomic build
 from audit import report_directory_name  # noqa: E402
+from engine import decide  # noqa: E402  picks the imatrix variant (same rule the PDF uses)
 from sthamly_common import (  # noqa: E402
     JOB_DONE, JOB_FAILED, JOB_KINDS, JOB_QUEUED, JOB_REFUSED, JOB_RUNNING,
     PUBLIC_VARIANT, STEP_LABELS, TABLE_JOBS, TIMEOUT_UPLOAD,
@@ -84,6 +84,12 @@ S_PLAIN = "Quantize plain Q4_K_M"
 S_HINDI = "Quantize Hindi Q4_K_M"
 S_AUDIT = "Run audit"
 S_SAVE = "Save results"
+
+# Web (lib/jobs.ts CalibrateResult) vocabulary for the verdict.
+WEB_DECISION = {"improved": "improved", "kept_plain": "no_clear_gain"}
+
+NUMERIC_KEYS = ("kld", "kld_error", "rms", "rms_error", "same_top_p", "same_top_p_error")
+NON_NEGATIVE_KEYS = ("kld", "kld_error")
 
 
 # ============================================================
@@ -159,11 +165,15 @@ def config_problems(kind: str) -> list[str]:
     return problems
 
 
-def preflight(kind: str) -> None:
-    problems = config_problems(kind)
+def disk_problems() -> list[str]:
     free = free_gb(pm.GGUF_DIR)
     if free < MIN_FREE_GB:
-        problems.append(f"free disk {free:.1f} GB; need at least {MIN_FREE_GB:g} GB")
+        return [f"free disk {free:.1f} GB; need at least {MIN_FREE_GB:g} GB"]
+    return []
+
+
+def preflight(kind: str) -> None:
+    problems = config_problems(kind) + disk_problems()
     if problems:
         raise JobError("Preflight failed: " + "; ".join(problems))
 
@@ -273,11 +283,12 @@ def validate_audit_report(report: Any, kind: str) -> dict[str, dict[str, Any]]:
             raise JobError("Audit report has a malformed result row.")
         if item.get("domain") != "hindi" or item.get("variant") not in REQUIRED_VARIANTS[kind]:
             continue
-        for key in ("kld", "kld_error", "rms", "rms_error", "same_top_p", "same_top_p_error"):
+        for key in NUMERIC_KEYS:
             value = item.get(key)
-            if isinstance(value, bool) or not isinstance(value, (int, float)) \
-                    or not math.isfinite(value) or value < 0 and key in ("kld", "kld_error"):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
                 raise JobError(f"Audit report: invalid {key} for {item.get('variant')}: {value!r}")
+            if key in NON_NEGATIVE_KEYS and value < 0:
+                raise JobError(f"Audit report: negative {key} for {item.get('variant')}: {value!r}")
         picked[item["variant"]] = item
 
     missing = set(REQUIRED_VARIANTS[kind]) - set(picked)
@@ -296,6 +307,21 @@ def public_results(picked: dict[str, dict[str, Any]]) -> dict[str, dict[str, dic
             "top": [item["same_top_p"], item["same_top_p_error"]],
         }
     return out
+
+
+def verdict_fields(report: dict[str, Any]) -> dict[str, Any]:
+    """
+    The verdict the web shows (lib/jobs.ts CalibrateResult). Comes from engine.decide(), the same rule
+    the PDF uses. Variant names are converted to public names ('hindi60'), decision to web words.
+    """
+    verdict = decide(report)
+    best = verdict.get("best")
+    return {
+        "decision": WEB_DECISION.get(verdict.get("decision"), "no_clear_gain"),
+        "best": PUBLIC_VARIANT.get(best, best) if best else None,
+        "clear_domains": list(verdict.get("clear_domains") or []),
+        "reduction_pct": {k: float(v) for k, v in (verdict.get("reduction_pct") or {}).items()},
+    }
 
 
 def count_lines(path: Path) -> int:
@@ -511,6 +537,8 @@ def run_build(db: Supabase, rec: Recorder, kind: str, model_id: str, name: str) 
         "note": "KLD vs FP16 on held-out text. A proxy, not task accuracy.",
         "generated_at": now_iso(),
     }
+    if kind == "calibrate":
+        common.update(verdict_fields(report))
     rec.done(S_SAVE)
     return {"kind": kind, **common}
 
@@ -570,6 +598,9 @@ def process_job(db: Supabase, row: dict[str, Any]) -> str:
 def claim_next(db: Supabase) -> dict[str, Any] | None:
     """Atomic claim via the claim_next_job() RPC (FOR UPDATE SKIP LOCKED in SQL)."""
     row = db.rpc("claim_next_job", {})
+    # A SETOF or TABLE return comes back as a JSON list; a single row comes back as an object.
+    if isinstance(row, list):
+        row = row[0] if row else None
     return row if isinstance(row, dict) and row.get("id") else None
 
 
@@ -609,9 +640,7 @@ def cmd_check(db: Supabase) -> int:
     except SupabaseError as exc:
         problems.append(f"Supabase: {scrub(exc, (db.key,), 200)}")
     problems += config_problems("calibrate")
-    free = free_gb(pm.GGUF_DIR)
-    if free < MIN_FREE_GB:
-        problems.append(f"free disk {free:.1f} GB; need at least {MIN_FREE_GB:g} GB")
+    problems += disk_problems()
     if problems:
         for problem in problems:
             print(f"FAIL: {problem}")
