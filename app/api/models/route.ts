@@ -143,8 +143,9 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ id: dup.id, status: dup.status, deduped: true }, { status: 200 })
       }
     }
-    return NextResponse.json({ error: 'db_insert_failed' }, { status: 500 })
+    return NextResponse.json({ error: 'failed_to_create' }, { status: 500 })
   }
 
+  // ✅ सफलतापूर्वक नया जॉब क्रिएट होने पर रिस्पॉन्स भेजें
   return NextResponse.json({ id: data.id, status: data.status, deduped: false }, { status: 201 })
 }
