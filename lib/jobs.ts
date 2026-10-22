@@ -93,6 +93,9 @@ const CREATE_ERRORS: Record<string, string> = {
   rate_limited: 'Aaj ke 3 free audit ho chuke. Kal dobara try karo.',
   queue_full: 'Abhi line bahut lambi hai. Thodi der baad dobara try karo.',
   not_available: 'Free public audit abhi band hai. Apna model Sthamly Desk par check karein.',
+  server_not_configured: 'Server ki setup adhoori hai. Thodi der baad try karo ya admin ko batao.',
+  lookup_failed: 'Queue abhi check nahi ho paayi. Thodi der baad dobara try karo.',
+  failed_to_create: 'Job queue nahi ho payi. Thodi der baad dobara try karo.',
 }
 
 /** Message for an error code returned by create_audit_job (anything unknown gets a generic line). */
