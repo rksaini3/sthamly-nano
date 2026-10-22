@@ -92,6 +92,7 @@ const CREATE_ERRORS: Record<string, string> = {
   invalid_model: 'Model ID sahi nahi hai. Aise likho: owner/model-name (jaise Qwen/Qwen2.5-1.5B-Instruct).',
   rate_limited: 'Aaj ke 3 free audit ho chuke. Kal dobara try karo.',
   queue_full: 'Abhi line bahut lambi hai. Thodi der baad dobara try karo.',
+  not_available: 'Free public audit abhi band hai. Apna model Sthamly Desk par check karein.',
 }
 
 /** Message for an error code returned by create_audit_job (anything unknown gets a generic line). */
