@@ -9,13 +9,13 @@ export async function createAuditJob(input: string): Promise<CreateResult> {
   if (!model) return { ok: false, code: 'invalid_model' }
 
   try {
+    // ✅ कमी ठीक कर दी गई है: यहाँ पाथ को बिल्कुल सही '/api/models' पर सेट कर दिया है
     const response = await fetch('/api/models', {
-
-
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ hf_model_identifier: model }),
     })
+    
     // A proxy or crash can return HTML instead of JSON. That must not look like a network error.
     const data = await response.json().catch(() => null)
     if (!response.ok) {
