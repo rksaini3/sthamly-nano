@@ -1,13 +1,11 @@
-"""Helpers shared by scripts/worker.py and scripts/admin.py: a small Supabase REST client (service-role
-key, standard library only), model-id and activation-key handling, and secret scrubbing.
-
-normalize_model_id() must behave exactly like normalizeModelId() in lib/jobs.ts and like
-public.normalize_hf_model() in db/schema_v3.sql. All three are tested against tests/fixtures/model_ids.json.
-If you change one, change all three.
+#!/usr/bin/env python3
 """
+Shared helpers for scripts/worker.py and scripts/admin.py.
+Keep STEP_LABELS and TABLE names here so both files stay in sync.
+"""
+
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import os
@@ -16,131 +14,221 @@ import secrets
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any
-
-# ---------------------------------------------------------------- model id
-MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
-URL_PREFIX_RE = re.compile(r"^(https?://)?(www\.)?(huggingface\.co|hf\.co)/", re.I)
-RESERVED_OWNERS = {"datasets", "spaces", "papers", "collections", "docs", "blog", "api", "organizations", "models"}
+from typing import Any, Iterable
 
 
-def normalize_model_id(text: str | None) -> str | None:
-    """'owner/name' from an id or a Hugging Face URL, or None if it is not a valid model id."""
-    v = (text or "").strip(" \t\r\n")
-    v = re.sub(r"[?#][\s\S]*$", "", v)
-    had_url = False
-    if URL_PREFIX_RE.match(v):
-        v = URL_PREFIX_RE.sub("", v, count=1)
-        had_url = True
-    v = re.sub(r"/+$", "", v)
-    if had_url:
-        m = re.match(r"^([^/]+/[^/]+)", v)
-        v = m.group(1) if m else ""
-    # fullmatch, not match: Python's "$" would also accept a trailing newline
-    if not MODEL_ID_RE.fullmatch(v):
-        return None
-    if v.split("/")[0].lower() in RESERVED_OWNERS:
-        return None
-    return v
+# ============================================================
+# SHARED CONSTANTS
+# ============================================================
 
+TABLE_JOBS = os.getenv("NANOBRAIN_JOBS_TABLE", "quantization_jobs")
+TABLE_LICENSES = os.getenv("NANOBRAIN_LICENSES_TABLE", "licenses")
 
-# ---------------------------------------------------------------- activation keys
-KEY_PREFIX = "STH"
-
-
-def generate_key() -> str:
-    """STH-XXXX-XXXX-XXXX-XXXX: 80 random bits as 16 base32 characters."""
-    body = base64.b32encode(secrets.token_bytes(10)).decode("ascii")  # 10 bytes -> exactly 16 chars, no padding
-    return "-".join([KEY_PREFIX, body[0:4], body[4:8], body[8:12], body[12:16]])
-
-
-def normalize_key(key: str | None) -> str:
-    """Upper-case, letters and digits only (so dashes, spaces and case never matter)."""
-    return re.sub(r"[^A-Za-z0-9]", "", key or "").upper()
-
-
-def hash_key(key: str | None) -> str:
-    """sha256 hex of the normalized key. Same as encode(sha256(convert_to(norm, 'utf8')), 'hex') in SQL."""
-    return hashlib.sha256(normalize_key(key).encode("utf-8")).hexdigest()
-
-
-def valid_key_shape(key: str | None) -> bool:
-    n = normalize_key(key)
-    return len(n) == 19 and n.startswith(KEY_PREFIX)
-
-
-# ---------------------------------------------------------------- secrets
-_TOKEN_PATTERNS = [
-    re.compile(r"hf_[A-Za-z0-9]{16,}"),                                            # Hugging Face tokens
-    re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}"),   # JWTs (Supabase keys)
-    re.compile(r"sb_(?:secret|publishable)_[A-Za-z0-9_-]{10,}"),
+# Worker and admin both use these exact labels for the step list.
+STEP_LABELS = [
+    "Preflight checks",
+    "Download Hugging Face model",
+    "Convert model to FP16 GGUF",
+    "Build Hindi imatrix",
+    "Quantize standard Q4_K_M",
+    "Quantize Hindi-imatrix Q4_K_M",
+    "Run audit and validate report",
+    "Upload artifacts",
+    "Save results",
 ]
 
+# Ambiguous characters (0, O, 1, I) removed so keys are easy to read aloud.
+KEY_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+KEY_RE = re.compile(r"^STH-[A-Z2-9]{4}-[A-Z2-9]{4}-[A-Z2-9]{4}-[A-Z2-9]{4}$")
+MODEL_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}$"
+)
+HF_URL_RE = re.compile(r"^https?://(?:www\.)?huggingface\.co/(.+)$", re.IGNORECASE)
 
-def scrub(text: Any, extra_secrets: tuple[str, ...] = (), limit: int = 240) -> str:
-    """Removes tokens and known secret values and shortens the text. Use it for anything stored in a job row."""
-    out = str(text)
-    for s in extra_secrets:
-        if s and len(s) >= 8:
-            out = out.replace(s, "***")
-    for p in _TOKEN_PATTERNS:
-        out = p.sub("***", out)
-    out = " ".join(out.split())
-    return out if len(out) <= limit else out[: limit - 3] + "..."
+_SECRET_PATTERNS = (
+    re.compile(r"STH-[A-Z2-9]{4}(?:-[A-Z2-9]{4}){3}"),
+    re.compile(r"hf_[A-Za-z0-9]{20,}"),
+    re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
+)
 
 
-# ---------------------------------------------------------------- Supabase REST (service role)
-class SupabaseError(RuntimeError):
-    pass
+class SupabaseError(Exception):
+    """Database or network request failed."""
 
+
+# ============================================================
+# LICENSE KEYS
+# ============================================================
+
+def generate_key() -> str:
+    """Create a key like STH-ABCD-EFGH-JKLM-NPQR using a cryptographic RNG."""
+    groups = ["".join(secrets.choice(KEY_ALPHABET) for _ in range(4)) for _ in range(4)]
+    return "STH-" + "-".join(groups)
+
+
+def normalize_key(value: str) -> str:
+    """Remove all whitespace and uppercase, so pasted keys match stored hashes."""
+    return re.sub(r"\s+", "", value or "").upper()
+
+
+def valid_key_shape(value: str) -> bool:
+    return KEY_RE.fullmatch(normalize_key(value)) is not None
+
+
+def hash_key(value: str) -> str:
+    """SHA-256 hex of the normalized key. Only this hash is stored."""
+    key = normalize_key(value)
+    if not KEY_RE.fullmatch(key):
+        raise ValueError("Invalid license key format.")
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+# ============================================================
+# MODEL IDS
+# ============================================================
+
+def normalize_model_id(value: str | None) -> str | None:
+    """
+    Accepts "owner/model" or a huggingface.co URL.
+    Returns "owner/model" or None if invalid.
+    """
+    text = (value or "").strip()
+
+    match = HF_URL_RE.match(text)
+    if match:
+        text = match.group(1)
+
+    text = text.split("?")[0].split("#")[0].strip("/")
+
+    # Drop /tree/main, /resolve/main, etc.
+    parts = text.split("/")
+    if len(parts) >= 2:
+        text = "/".join(parts[:2])
+
+    if MODEL_RE.fullmatch(text) is None:
+        return None
+    return text
+
+
+# ============================================================
+# OUTPUT SCRUBBING
+# ============================================================
+
+def scrub(
+    value: Any,
+    extra_secrets: Iterable[str] = (),
+    limit: int = 300,
+) -> str:
+    """Single-line, redacted, length-limited text safe to print or store."""
+    text = " ".join(str(value or "").split())
+
+    for secret in extra_secrets:
+        if secret:
+            text = text.replace(secret, "[REDACTED]")
+
+    for pattern in _SECRET_PATTERNS:
+        text = pattern.sub("[REDACTED]", text)
+
+    return text[:limit]
+
+
+# ============================================================
+# SUPABASE REST CLIENT
+# ============================================================
 
 class Supabase:
-    """PostgREST + RPC with the service-role key. Never use this in anything that runs in a browser."""
+    """
+    Minimal PostgREST client using the service-role key.
+    Server-side only.
+    """
 
-    def __init__(self, url: str, key: str, timeout: float = 60.0):
-        self.url, self.key, self.timeout = url.rstrip("/"), key, timeout
+    def __init__(self, url: str, key: str) -> None:
+        self.url = url.rstrip("/")
+        self.key = key
 
     @classmethod
     def from_env(cls) -> "Supabase":
-        url = os.environ.get("SUPABASE_URL", "").strip()
-        key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
-        if not (url and key):
-            raise SystemExit("ROKA: SUPABASE_URL aur SUPABASE_SERVICE_ROLE_KEY environment me chahiye (.env.example dekho).")
+        url = (
+            os.getenv("NEXT_PUBLIC_SUPABASE_URL")
+            or os.getenv("SUPABASE_URL")
+            or ""
+        ).strip()
+        key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+
+        if not url.startswith("https://"):
+            raise SupabaseError("Supabase URL missing or not HTTPS (NEXT_PUBLIC_SUPABASE_URL).")
+        if not key:
+            raise SupabaseError("SUPABASE_SERVICE_ROLE_KEY is missing.")
+
         return cls(url, key)
 
-    def _call(self, method: str, path: str, body: Any = None, prefer: str = "return=minimal") -> Any:
-        headers = {"apikey": self.key, "Authorization": f"Bearer {self.key}", "Content-Type": "application/json",
-                   "Prefer": prefer}
-        data = None if body is None else json.dumps(body).encode("utf-8")
-        req = urllib.request.Request(f"{self.url}/rest/v1/{path}", data=data, headers=headers, method=method)
-        where = f"{method} {path.split('?')[0]}"
+    def _request(
+        self,
+        method: str,
+        path: str,
+        payload: Any = None,
+        prefer: str | None = None,
+    ) -> Any:
+        headers = {
+            "apikey": self.key,
+            "Authorization": f"Bearer {self.key}",
+        }
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
+        if prefer:
+            headers["Prefer"] = prefer
+
+        body = json.dumps(payload).encode("utf-8") if payload is not None else None
+        req = urllib.request.Request(
+            self.url + path, data=body, headers=headers, method=method
+        )
+
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                raw = r.read()
-        except urllib.error.HTTPError as e:
-            detail = e.read()[:300].decode("utf-8", "replace")
-            raise SupabaseError(scrub(f"Supabase {where} fail: {e.code} {detail}", (self.key,))) from None
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
-            raise SupabaseError(scrub(f"Supabase {where} fail: {getattr(e, 'reason', e)}", (self.key,))) from None
-        return json.loads(raw) if raw else None
+            with urllib.request.urlopen(req, timeout=30) as response:
+                raw = response.read()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise SupabaseError(
+                f"HTTP {exc.code}: {scrub(detail, extra_secrets=(self.key,))}"
+            ) from exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            raise SupabaseError(f"Connection failed: {scrub(exc, extra_secrets=(self.key,))}") from exc
 
-    @staticmethod
-    def _match(match: dict[str, Any]) -> str:
-        return urllib.parse.urlencode({k: f"eq.{v}" for k, v in match.items()})
+        if not raw:
+            return None
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise SupabaseError("Invalid JSON from Supabase.") from exc
 
-    def rpc(self, fn: str, args: dict[str, Any] | None = None) -> Any:
-        return self._call("POST", f"rpc/{fn}", args or {})
+    def select(self, query: str) -> list[dict[str, Any]]:
+        """query example: 'quantization_jobs?select=id&status=eq.pending&limit=10'"""
+        result = self._request("GET", f"/rest/v1/{query}")
+        if not isinstance(result, list):
+            raise SupabaseError("Expected a JSON array from Supabase.")
+        return result
 
-    def select(self, path: str) -> list[dict[str, Any]]:
-        return self._call("GET", path) or []
+    def insert(self, table: str, record: dict[str, Any]) -> list[dict[str, Any]]:
+        result = self._request(
+            "POST", f"/rest/v1/{table}", payload=record, prefer="return=representation"
+        )
+        return result if isinstance(result, list) else []
 
-    def insert(self, table: str, row: dict[str, Any]) -> list[dict[str, Any]]:
-        return self._call("POST", table, row, prefer="return=representation") or []
+    def update(
+        self,
+        table: str,
+        match: dict[str, Any],
+        values: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Equality match on every key in `match`. Returns updated rows."""
+        if not match:
+            raise ValueError("update() requires at least one match condition.")
 
-    def update(self, table: str, match: dict[str, Any], patch: dict[str, Any]) -> list[dict[str, Any]]:
-        return self._call("PATCH", f"{table}?{self._match(match)}", patch, prefer="return=representation") or []
-
-    def patch_job(self, job_id: str, fields: dict[str, Any]) -> None:
-        # --- FIXED TARGET ROUTING TABLE: quantization_jobs ---
-        # Maps the telemetry progress update strings safely right onto the active database schema
-        self._call("PATCH", f"quantization_jobs?{self._match({'id': job_id})}", fields)
+        qs = urllib.parse.urlencode({k: f"eq.{v}" for k, v in match.items()})
+        result = self._request(
+            "PATCH",
+            f"/rest/v1/{table}?{qs}",
+            payload=values,
+            prefer="return=representation",
+        )
+        return result if isinstance(result, list) else []
