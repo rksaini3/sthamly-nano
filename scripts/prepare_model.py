@@ -1,186 +1,299 @@
-"""Step 1 of the pipeline: download a model, convert it to FP16 GGUF, and build the
-plain Q4_K_M baseline (no imatrix) from that SAME FP16 file.
-
-Exit codes (backend in ko padh sakta hai):
-    0  success
-    1  runtime failure (download/convert/quantize/disk/lock)
-    3  REFUSED: model me custom code (auto_map)           -> status "rejected"
-    4  REFUSED: policy (bad id / license / size / no safetensors) -> status "rejected"
+#!/usr/bin/env python3
 """
+Sthamly NanoBrain: model prepare step.
+
+Downloads a Hugging Face model, verifies policy, converts it to FP16 GGUF,
+and builds the plain Q4_K_M baseline (no imatrix) from the SAME FP16 file.
+
+This module is used two ways:
+    1. Imported by scripts/worker.py (preferred, one job at a time, job id given)
+    2. Run standalone for manual testing:
+         python scripts/prepare.py --model org/name --job-id UUID
+
+Exit codes:
+    0  success
+    1  runtime failure (download, convert, quantize, disk, timeout)
+    3  rejected: custom code (auto_map or .py files)
+    4  rejected: policy (bad id, no safetensors, license, size)
+    5  busy: another job is already preparing this model
+"""
+
 from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
-import urllib.parse
-import urllib.request
 from pathlib import Path
+from typing import Any, Callable
+
+try:
+    import fcntl
+except ImportError:  # Windows dev machine
+    fcntl = None  # type: ignore[assignment]
 
 from huggingface_hub import HfApi, snapshot_download
 
-try:  # Linux (RunPod) par locking; Windows dev box par skip.
-    import fcntl
-except ImportError:  # pragma: no cover
-    fcntl = None
+SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT = SCRIPT_DIR.parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
 
-ROOT = Path(__file__).resolve().parent.parent
-LLAMA = ROOT / "llama.cpp"
+from sthamly_common import (  # noqa: E402
+    TABLE_JOBS,
+    Supabase,
+    SupabaseError,
+    normalize_model_id,
+    scrub,
+)
+
+
+# ============================================================
+# PATHS AND CONFIG
+# ============================================================
+
+LLAMA_DIR = Path(os.getenv("LLAMA_CPP_DIR", str(ROOT / "llama.cpp")))
+CONVERT = Path(os.getenv("LLAMA_CPP_CONVERTER", str(LLAMA_DIR / "convert_hf_to_gguf.py")))
+QUANTIZE = Path(os.getenv("LLAMA_QUANTIZE", str(LLAMA_DIR / "build" / "bin" / "llama-quantize")))
+
 HF_DIR = ROOT / "models" / "hf"
 GGUF_DIR = ROOT / "models" / "gguf"
-CONVERT = LLAMA / "convert_hf_to_gguf.py"
-QUANTIZE = LLAMA / "build" / "bin" / "llama-quantize"
 
-FAIL_EXIT = 1
-CUSTOM_CODE_EXIT = 3
-POLICY_EXIT = 4
+DEFAULT_ALLOWED_LICENSES = "apache-2.0,mit"
+DEFAULT_MAX_GB = float(os.getenv("MAX_MODEL_GB", "20"))
+DISK_FACTOR = 2.5
+CONVERT_TIMEOUT = int(os.getenv("CONVERT_TIMEOUT", "3600"))
+QUANT_TIMEOUT = int(os.getenv("QUANT_TIMEOUT", "3600"))
+DOWNLOAD_TIMEOUT_NOTE = "snapshot_download has no hard timeout; use HF_HUB_DOWNLOAD_TIMEOUT if needed"
 
-# "org/name" -- sirf safe characters; path-traversal / shell-weird naam band.
-MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][\w.\-]*/[A-Za-z0-9][\w.\-]*$")
-DEFAULT_LICENSES = "apache-2.0,mit"
-DEFAULT_MAX_GB = 20.0          # RTX 3090 (24 GB) ke liye; env MAX_MODEL_GB se badlo
-DISK_FACTOR = 2.5              # HF weights + FP16 GGUF + Q4 + margin
+# Status names MUST match worker.py and the jobs table.
+STATUS_RUNNING = os.getenv("NANOBRAIN_RUNNING_STATUS", "extracting")
+STATUS_FAILED = "failed"
+STATUS_REJECTED = "rejected"  # only if your DB constraint allows it; see note in worker
+
+EXIT_OK = 0
+EXIT_FAIL = 1
+EXIT_CUSTOM_CODE = 3
+EXIT_POLICY = 4
+EXIT_BUSY = 5
+
+# Strict "owner/name" -- ASCII letters, digits, dot, underscore, hyphen only.
+MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
+
+# Custom-code files that can run arbitrary Python when trust_remote_code is used.
+CUSTOM_CODE_FILES_RE = re.compile(r"^(modeling_|configuration_|tokenization_).*\.py$|\.py$")
 
 
-class PipelineError(Exception):
-    """Controlled failure. `status` DB me jayega; `report=False` = DB ko mat chhedo."""
+class PrepareError(Exception):
+    """Controlled failure. `status` is written to the job; `report=False` leaves the job alone."""
 
-    def __init__(self, msg: str, code: int = FAIL_EXIT, status: str = "failed",
-                 report: bool = True):
-        super().__init__(msg)
+    def __init__(
+        self,
+        message: str,
+        code: int = EXIT_FAIL,
+        status: str = STATUS_FAILED,
+        report: bool = True,
+    ) -> None:
+        super().__init__(message)
         self.code = code
         self.status = status
         self.report = report
 
 
-def run(cmd):
-    """Run a command and let its output stream to the terminal."""
-    cmd = [str(c) for c in cmd]
-    print("$", " ".join(cmd), flush=True)
-    if subprocess.run(cmd).returncode != 0:
-        raise PipelineError(f"FAILED: {' '.join(cmd[:3])} ...")
+# ============================================================
+# COMMAND RUNNER WITH TIMEOUT
+# ============================================================
+
+def run(command: list[Any], timeout: int) -> None:
+    """
+    Run a real command with a hard timeout. Output streams to the terminal.
+    Raises PrepareError on timeout or non-zero exit.
+    """
+    cmd = [str(part) for part in command]
+    print("$ " + " ".join(cmd), flush=True)
+
+    try:
+        completed = subprocess.run(cmd, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired as exc:
+        raise PrepareError(
+            f"Command timed out after {timeout} seconds: {cmd[0]}"
+        ) from exc
+    except OSError as exc:
+        raise PrepareError(f"Could not execute {cmd[0]}: {exc}") from exc
+
+    if completed.returncode != 0:
+        raise PrepareError(
+            f"Command failed with exit code {completed.returncode}: {cmd[0]}"
+        )
 
 
-# --------------------------------------------------------------------------- DB
+# ============================================================
+# JOB STATUS REPORTER (Supabase, by job id only)
+# ============================================================
+
 class JobReporter:
-    """Supabase me live progress push karta hai.
-
-    Preferred: --job-id / JOB_ID  -> sirf wahi ek row update hoti hai (id=eq.<job>).
-    Legacy fallback (job id nahi): purana behaviour -- hf_model_identifier se match;
-    ISSE us model ke SAARE jobs update ho jate hain, isliye warning aati hai.
+    """
+    Updates exactly one row: quantization_jobs where id = job_id.
+    Never falls back to model-name matching, which could touch other jobs.
+    Also sets heartbeat_at so reap_stale_jobs does not kill a healthy job.
     """
 
-    def __init__(self, model_id: str, job_id: str | None):
-        self.model_id = model_id
+    def __init__(self, job_id: str | None) -> None:
         self.job_id = (job_id or "").strip() or None
-        self.url = (os.environ.get("SUPABASE_URL")
-                    or os.environ.get("NEXT_PUBLIC_SUPABASE_URL") or "").rstrip("/")
-        self.key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-        self._warned_legacy = False
-        self._warned_fail = False
+        self._db: Supabase | None = None
+        self._warned = False
 
-    def _filter(self) -> str:
         if self.job_id:
-            return "id=eq." + urllib.parse.quote(self.job_id, safe="")
-        if not self._warned_legacy:
-            print("[db-status] WARNING: --job-id nahi diya; model-name se update ho raha "
-                  "hai (is model ke sab jobs prabhavit honge).", file=sys.stderr)
-            self._warned_legacy = True
-        return ("hf_model_identifier=eq."
-                + urllib.parse.quote(self.model_id, safe=""))
+            try:
+                self._db = Supabase.from_env()
+            except SupabaseError as exc:
+                print(f"[db-status] disabled: {scrub(exc, limit=200)}", file=sys.stderr)
 
-    def update(self, status: str, progress: int | None = None) -> None:
-        if not self.url or not self.key:
-            return  # standalone terminal mode: chup-chap skip
-        payload = {"status": status}
+    def update(self, status: str | None = None, progress: int | None = None,
+               step: str | None = None) -> None:
+        if self._db is None or self.job_id is None:
+            return  # standalone terminal mode
+
+        from datetime import datetime, timezone
+
+        fields: dict[str, Any] = {"heartbeat_at": datetime.now(timezone.utc).isoformat()}
+        if status is not None:
+            fields["status"] = status
         if progress is not None:
-            payload["progress"] = progress
-        req = urllib.request.Request(
-            f"{self.url}/rest/v1/quantization_jobs?{self._filter()}",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json", "apikey": self.key,
-                     "Authorization": f"Bearer {self.key}"},
-            method="PATCH",
-        )
+            fields["progress"] = progress
+        if step is not None:
+            fields["step"] = step
+
         try:
-            with urllib.request.urlopen(req, timeout=5):
-                pass
-        except Exception as e:  # cosmetic -- compile ko kabhi mat roko, par chup bhi mat raho
-            if not self._warned_fail:
-                print(f"[db-status] update fail ({type(e).__name__}); "
-                      "aage progress updates bhi fail ho sakte hain.", file=sys.stderr)
-                self._warned_fail = True
+            self._db.patch_job_by_id(TABLE_JOBS, self.job_id, fields)
+        except SupabaseError as exc:
+            if not self._warned:
+                print(f"[db-status] update failed: {scrub(exc, limit=200)}", file=sys.stderr)
+                self._warned = True
 
 
-# ---------------------------------------------------------------------- Safety
+# ============================================================
+# SAFETY CHECKS
+# ============================================================
+
 def validate_model_id(model_id: str) -> str:
-    model_id = (model_id or "").strip()
-    if not MODEL_ID_RE.match(model_id) or ".." in model_id:
-        raise PipelineError(f"REFUSED: model id galat format ('org/name' chahiye): {model_id!r}",
-                            POLICY_EXIT, "rejected")
-    return model_id
+    cleaned = (model_id or "").strip()
+    if not MODEL_ID_RE.fullmatch(cleaned) or ".." in cleaned:
+        raise PrepareError(
+            f"REFUSED: model id must be 'owner/name': {cleaned!r}",
+            EXIT_POLICY,
+            STATUS_REJECTED,
+        )
+    return cleaned
 
 
-def check_policy(model_id: str, revision: str | None, hf_token: str | None,
-                 allowed_licenses: set[str], check_license: bool, max_gb: float):
-    """Download se PEHLE: exists? safetensors? license? size? -> (commit_sha, total_bytes, license)."""
+def check_policy(
+    model_id: str,
+    revision: str | None,
+    hf_token: str | None,
+    allowed_licenses: set[str],
+    check_license: bool,
+    max_gb: float,
+) -> tuple[str, int, str]:
+    """
+    Runs BEFORE any download. Returns (commit_sha, total_weight_bytes, license).
+    Pinning to the commit sha means the download matches what was checked.
+    """
     try:
-        info = HfApi(token=hf_token).model_info(model_id, revision=revision,
-                                                files_metadata=True)
-    except Exception as e:
-        raise PipelineError(f"REFUSED: model info nahi mili ({type(e).__name__}) -- "
-                            "private/gated/galat naam?", POLICY_EXIT, "rejected")
+        info = HfApi(token=hf_token).model_info(
+            model_id, revision=revision, files_metadata=True
+        )
+    except Exception as exc:
+        raise PrepareError(
+            f"REFUSED: model info not available ({type(exc).__name__}). "
+            "Private, gated, or wrong name?",
+            EXIT_POLICY,
+            STATUS_REJECTED,
+        ) from exc
 
-    st = [s for s in (info.siblings or []) if s.rfilename.endswith(".safetensors")]
-    if not st:
-        raise PipelineError("REFUSED: repo me .safetensors weights nahi hain.",
-                            POLICY_EXIT, "rejected")
+    if not info.sha:
+        raise PrepareError("REFUSED: Hugging Face did not return a commit sha.",
+                           EXIT_POLICY, STATUS_REJECTED)
 
-    total = sum((s.size or 0) for s in st)
+    siblings = info.siblings or []
+    safetensors = [s for s in siblings if s.rfilename.endswith(".safetensors")]
+    if not safetensors:
+        raise PrepareError("REFUSED: repo has no .safetensors weights.",
+                           EXIT_POLICY, STATUS_REJECTED)
+
+    custom_py = [s.rfilename for s in siblings if CUSTOM_CODE_FILES_RE.search(s.rfilename)]
+    if custom_py:
+        raise PrepareError(
+            f"REFUSED: repo contains Python files (custom code): {custom_py[:3]}",
+            EXIT_CUSTOM_CODE,
+            STATUS_REJECTED,
+        )
+
+    total = sum((s.size or 0) for s in safetensors)
+    if total <= 0:
+        raise PrepareError("REFUSED: could not determine weight size.",
+                           EXIT_POLICY, STATUS_REJECTED)
     if total > max_gb * 1e9:
-        raise PipelineError(f"REFUSED: weights {total / 1e9:.1f} GB hain; limit {max_gb:g} GB.",
-                            POLICY_EXIT, "rejected")
+        raise PrepareError(
+            f"REFUSED: weights are {total / 1e9:.1f} GB; limit is {max_gb:g} GB.",
+            EXIT_POLICY,
+            STATUS_REJECTED,
+        )
 
-    lic = None
+    license_value = None
     card = getattr(info, "card_data", None)
     if card is not None:
-        lic = getattr(card, "license", None)
-    if not lic:
-        for t in info.tags or []:
-            if t.startswith("license:"):
-                lic = t.split(":", 1)[1]
+        license_value = getattr(card, "license", None)
+    if not license_value:
+        for tag in info.tags or []:
+            if tag.startswith("license:"):
+                license_value = tag.split(":", 1)[1]
                 break
-    if isinstance(lic, (list, tuple)):
-        lic = lic[0] if lic else None
-    lic_norm = (lic or "").strip().lower()
+    if isinstance(license_value, (list, tuple)):
+        license_value = license_value[0] if license_value else None
+    license_norm = (license_value or "unknown").strip().lower()
 
-    if check_license and lic_norm not in allowed_licenses:
-        raise PipelineError(f"REFUSED: license {lic or 'unknown'!r} allow-list me nahi "
-                            f"({', '.join(sorted(allowed_licenses))}).", POLICY_EXIT, "rejected")
+    if check_license and license_norm not in allowed_licenses:
+        raise PrepareError(
+            f"REFUSED: license {license_norm!r} is not in the allow-list "
+            f"({', '.join(sorted(allowed_licenses))}).",
+            EXIT_POLICY,
+            STATUS_REJECTED,
+        )
 
-    return info.sha, total, lic_norm or "unknown"
+    return info.sha, total, license_norm
 
 
-def refuse_custom_code(model_dir: Path) -> None:
-    cfg = model_dir / "config.json"
-    if not cfg.exists():
-        raise PipelineError("FAILED: config.json download nahi hua.")
+def check_downloaded_config(model_dir: Path) -> None:
+    """Second line of defence after download: reject auto_map and .py files."""
+    config = model_dir / "config.json"
+    if not config.is_file():
+        raise PrepareError("FAILED: config.json was not downloaded.")
+
     for name in ("config.json", "tokenizer_config.json"):
-        f = model_dir / name
-        if not f.exists():
+        path = model_dir / name
+        if not path.is_file():
             continue
         try:
-            data = json.loads(f.read_text(encoding="utf-8"))
-        except ValueError:
-            raise PipelineError(f"REFUSED: {name} padha nahi ja sakta.",
-                                CUSTOM_CODE_EXIT, "rejected")
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise PrepareError(f"REFUSED: {name} is unreadable.",
+                               EXIT_CUSTOM_CODE, STATUS_REJECTED) from exc
         if isinstance(data, dict) and "auto_map" in data:
-            raise PipelineError(f"REFUSED: {name} me auto_map hai (custom code).",
-                                CUSTOM_CODE_EXIT, "rejected")
+            raise PrepareError(f"REFUSED: {name} contains auto_map (custom code).",
+                               EXIT_CUSTOM_CODE, STATUS_REJECTED)
+
+    for path in model_dir.rglob("*.py"):
+        raise PrepareError(
+            f"REFUSED: downloaded repo contains Python file {path.name}.",
+            EXIT_CUSTOM_CODE,
+            STATUS_REJECTED,
+        )
 
 
 def check_disk(total_weight_bytes: int) -> None:
@@ -188,140 +301,205 @@ def check_disk(total_weight_bytes: int) -> None:
     free = shutil.disk_usage(ROOT / "models").free
     need = int(total_weight_bytes * DISK_FACTOR)
     if free < need:
-        raise PipelineError(f"FAILED: disk kam hai -- free {free / 1e9:.1f} GB, "
-                            f"chahiye ~{need / 1e9:.1f} GB.")
+        raise PrepareError(
+            f"FAILED: not enough disk. Free {free / 1e9:.1f} GB, need about "
+            f"{need / 1e9:.1f} GB."
+        )
+
+
+def converter_fingerprint() -> str:
+    """Hash of the converter and quantizer binary, so a tool upgrade rebuilds the FP16."""
+    digest = hashlib.sha256()
+    for path in (CONVERT, QUANTIZE):
+        if path.is_file():
+            digest.update(path.name.encode())
+            digest.update(str(path.stat().st_size).encode())
+            digest.update(str(int(path.stat().st_mtime)).encode())
+    return digest.hexdigest()[:16]
 
 
 @contextlib.contextmanager
 def model_lock(name: str):
-    """Ek hi model par do jobs ek saath files na bigaden."""
+    """One job per model at a time. Lock is released automatically by the OS on crash."""
     GGUF_DIR.mkdir(parents=True, exist_ok=True)
-    with open(GGUF_DIR / f"{name}.lock", "w") as fh:
+    handle = open(GGUF_DIR / f"{name}.lock", "w")
+    try:
         if fcntl is not None:
             try:
-                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                # report=False: doosre chalte job ka DB status mat bigado
-                raise PipelineError("Is model par doosra job already chal raha hai.",
-                                    report=False)
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise PrepareError(
+                    "Another job is already preparing this model.",
+                    EXIT_BUSY,
+                    report=False,
+                ) from exc
         yield
+    finally:
+        handle.close()
 
 
-def build_atomic(final: Path, builder) -> None:
-    """`.part` me banao, phir rename -- adhoori file kabhi 'taiyar' nahi dikhegi."""
+def build_atomic(final: Path, builder: Callable[[Path], None]) -> None:
+    """Build into '<name>.part' and rename only on success. Partial files never look finished."""
     part = final.with_name(final.name + ".part")
     part.unlink(missing_ok=True)
     try:
         builder(part)
-        if not part.exists() or part.stat().st_size == 0:
-            raise PipelineError(f"FAILED: {final.name} khali/missing bani.")
+        if not part.is_file() or part.stat().st_size == 0:
+            raise PrepareError(f"FAILED: {final.name} is empty or missing after build.")
         os.replace(part, final)
     except BaseException:
         part.unlink(missing_ok=True)
         raise
 
 
-# -------------------------------------------------------------------- Pipeline
-def prepare(model_id: str, hf_token: str | None, reporter: JobReporter, *,
-            revision: str | None = None, allowed_licenses: set[str] | None = None,
-            check_license: bool = True, max_gb: float = DEFAULT_MAX_GB,
-            cleanup_hf: bool = False) -> None:
-    for need in (CONVERT, QUANTIZE):
-        if not need.exists():
-            raise PipelineError(f"{need} nahi mila. Pehle `bash scripts/setup.sh` chalao.")
+# ============================================================
+# PIPELINE
+# ============================================================
+
+def prepare(
+    model_id: str,
+    hf_token: str | None,
+    reporter: JobReporter,
+    *,
+    revision: str | None = None,
+    allowed_licenses: set[str] | None = None,
+    check_license: bool = True,
+    max_gb: float = DEFAULT_MAX_GB,
+    cleanup_hf: bool = False,
+) -> dict[str, Any]:
+    """
+    Returns a dict with the artifact paths and metadata on success.
+    Raises PrepareError on any controlled failure.
+    """
+    for required in (CONVERT, QUANTIZE):
+        if not required.is_file():
+            raise PrepareError(
+                f"Tool not found: {required}. Check LLAMA_CPP_DIR or run the llama.cpp build."
+            )
 
     model_id = validate_model_id(model_id)
-    sha, total_bytes, lic = check_policy(model_id, revision, hf_token,
-                                         allowed_licenses or set(), check_license, max_gb)
-    print(f"[0/3] OK: {model_id} @ {sha[:8]} | license={lic} | weights={total_bytes / 1e9:.2f} GB")
+
+    sha, total_bytes, license_norm = check_policy(
+        model_id, revision, hf_token,
+        allowed_licenses or set(), check_license, max_gb,
+    )
+    print(f"[0/3] OK: {model_id} @ {sha[:8]} | license={license_norm} | "
+          f"weights={total_bytes / 1e9:.2f} GB", flush=True)
     check_disk(total_bytes)
 
     name = model_id.replace("/", "__")
-    HF_DIR.mkdir(parents=True, exist_ok=True)
-    GGUF_DIR.mkdir(parents=True, exist_ok=True)
     local = HF_DIR / name
     f16 = GGUF_DIR / f"{name}-f16.gguf"
     std = GGUF_DIR / f"{name}-Q4_K_M-standard.gguf"
-    f16_rev = f16.with_name(f16.name + ".rev")   # kis commit se bani, uska nishaan
+    stamp = GGUF_DIR / f"{name}-f16.stamp"
+    expected_stamp = f"{sha}\n{converter_fingerprint()}"
+
+    HF_DIR.mkdir(parents=True, exist_ok=True)
+    GGUF_DIR.mkdir(parents=True, exist_ok=True)
 
     with model_lock(name):
-        print("[1/3] Download")
-        reporter.update("extracting", 25)
-        snapshot_download(repo_id=model_id, revision=sha, local_dir=str(local),
-                          token=hf_token,
-                          allow_patterns=["*.json", "*.safetensors", "*.model", "*.txt",
-                                          "*.tiktoken"])
-        refuse_custom_code(local)
+        print("[1/3] Download", flush=True)
+        reporter.update(STATUS_RUNNING, 20, "Downloading model")
+        snapshot_download(
+            repo_id=model_id,
+            revision=sha,
+            local_dir=str(local),
+            token=hf_token,
+            allow_patterns=["*.json", "*.safetensors", "*.model", "*.txt", "*.tiktoken"],
+        )
+        check_downloaded_config(local)
 
-        print("[2/3] Convert to FP16 GGUF")
-        reporter.update("extracting", 45)
-        fresh = f16.exists() and f16_rev.exists() and f16_rev.read_text().strip() == sha
+        print("[2/3] Convert to FP16 GGUF", flush=True)
+        reporter.update(STATUS_RUNNING, 40, "Converting to FP16 GGUF")
+        fresh = f16.is_file() and stamp.is_file() and stamp.read_text().strip() == expected_stamp
         if fresh:
-            print("  FP16 pehle se hai (same commit), skip.")
+            print("  FP16 already built for this commit and tool version, skipping.", flush=True)
         else:
-            if f16.exists():
-                print("  Purani/unverified FP16 mili -- dobara bana raha hoon.")
-            # FP16 badli to usse bana Q4 bhi purana hai
-            for stale in (f16, f16_rev, std):
+            for stale in (f16, stamp, std):
                 stale.unlink(missing_ok=True)
             build_atomic(f16, lambda out: run(
-                [sys.executable, CONVERT, local, "--outfile", out, "--outtype", "f16"]))
-            f16_rev.write_text(sha)
+                [sys.executable, CONVERT, local, "--outfile", out, "--outtype", "f16"],
+                timeout=CONVERT_TIMEOUT,
+            ))
+            stamp.write_text(expected_stamp)
 
-        print("[3/3] Plain Q4_K_M (no imatrix), from the same FP16")
-        reporter.update("quantizing", 70)
-        if std.exists():
-            print("  Plain Q4 pehle se hai, skip.")
+        print("[3/3] Plain Q4_K_M (no imatrix) from the same FP16", flush=True)
+        reporter.update(STATUS_RUNNING, 70, "Building plain Q4_K_M")
+        if std.is_file():
+            print("  Plain Q4 already exists, skipping.", flush=True)
         else:
-            build_atomic(std, lambda out: run([QUANTIZE, f16, out, "Q4_K_M"]))
+            build_atomic(std, lambda out: run(
+                [QUANTIZE, f16, out, "Q4_K_M"],
+                timeout=QUANT_TIMEOUT,
+            ))
 
-        if cleanup_hf:
-            shutil.rmtree(local, ignore_errors=True)
+    if cleanup_hf:
+        shutil.rmtree(local, ignore_errors=True)
 
-    # Closing state callback: benchmark nodes ko signal
-    reporter.update("benchmarking", 85)
+    result = {
+        "model_id": model_id,
+        "commit_sha": sha,
+        "license": license_norm,
+        "weights_gb": round(total_bytes / 1e9, 3),
+        "fp16_path": str(f16),
+        "fp16_gb": round(f16.stat().st_size / 1e9, 3),
+        "standard_q4_path": str(std),
+        "standard_q4_gb": round(std.stat().st_size / 1e9, 3),
+    }
+    print("\nReady:", json.dumps(result, indent=2), flush=True)
+    return result
 
-    print(f"\nTaiyaar:\n  {f16} ({f16.stat().st_size / 1e9:.2f} GB)\n  "
-          f"{std} ({std.stat().st_size / 1e9:.2f} GB)")
-    print(f"\nAgla step: python scripts/trl4_bench.py --model {model_id}")
 
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Sthamly NanoBrain prepare step")
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--hf-token", default=os.getenv("HF_TOKEN"))
+    parser.add_argument("--job-id", default=os.getenv("JOB_ID"),
+                        help="quantization_jobs.id (uuid). Only this row is updated.")
+    parser.add_argument("--revision", default=None, help="branch, tag, or commit (default main)")
+    parser.add_argument("--allow-licenses",
+                        default=os.getenv("ALLOW_LICENSES", DEFAULT_ALLOWED_LICENSES))
+    parser.add_argument("--no-license-check", action="store_true",
+                        help="internal runs only: skip the license allow-list")
+    parser.add_argument("--max-gb", type=float, default=DEFAULT_MAX_GB)
+    parser.add_argument("--cleanup-hf", action="store_true",
+                        help="delete the HF snapshot after FP16 is built")
+    args = parser.parse_args(argv)
 
-def main(argv=None) -> int:
-    p = argparse.ArgumentParser()
-    p.add_argument("--model", required=True)
-    p.add_argument("--hf-token", default=os.getenv("HF_TOKEN"))
-    p.add_argument("--job-id", default=os.getenv("JOB_ID"),
-                   help="quantization_jobs.id (uuid). Dene se sirf yahi row update hoti hai.")
-    p.add_argument("--revision", default=None, help="HF branch/tag/commit (default: main)")
-    p.add_argument("--allow-licenses", default=os.getenv("ALLOW_LICENSES", DEFAULT_LICENSES),
-                   help="comma-separated license allow-list")
-    p.add_argument("--no-license-check", action="store_true",
-                   help="sirf internal runs ke liye: license check band")
-    p.add_argument("--max-gb", type=float,
-                   default=float(os.getenv("MAX_MODEL_GB", DEFAULT_MAX_GB)),
-                   help="safetensors total size limit (GB)")
-    p.add_argument("--cleanup-hf", action="store_true",
-                   help="FP16 GGUF banne ke baad HF snapshot delete karo (disk bachao)")
-    a = p.parse_args(argv)
+    model_id = normalize_model_id(args.model) or (args.model or "").strip()
+    reporter = JobReporter(args.job_id)
+    allowed = {x.strip().lower() for x in args.allow_licenses.split(",") if x.strip()}
 
-    model_id = (a.model or "").strip()
-    reporter = JobReporter(model_id, a.job_id)
-    allowed = {x.strip().lower() for x in a.allow_licenses.split(",") if x.strip()}
     try:
-        prepare(model_id, a.hf_token, reporter, revision=a.revision,
-                allowed_licenses=allowed, check_license=not a.no_license_check,
-                max_gb=a.max_gb, cleanup_hf=a.cleanup_hf)
-        return 0
-    except PipelineError as e:
-        print(str(e), file=sys.stderr)
-        if e.report:
-            reporter.update(e.status)
-        return e.code
-    except Exception as e:  # unexpected: DB ko 'failed' dikhao, atka hua spinner nahi
-        print(f"FAILED (unexpected): {type(e).__name__}: {e}", file=sys.stderr)
-        reporter.update("failed")
-        return FAIL_EXIT
+        prepare(
+            model_id,
+            args.hf_token,
+            reporter,
+            revision=args.revision,
+            allowed_licenses=allowed,
+            check_license=not args.no_license_check,
+            max_gb=args.max_gb,
+            cleanup_hf=args.cleanup_hf,
+        )
+        return EXIT_OK
+
+    except PrepareError as exc:
+        print(str(exc), file=sys.stderr)
+        if exc.report:
+            reporter.update(exc.status)
+        return exc.code
+
+    except KeyboardInterrupt:
+        print("\nCancelled by user.", file=sys.stderr)
+        reporter.update(STATUS_FAILED, step="Cancelled by user")
+        return 130
+
+    except Exception as exc:  # unexpected: never leave the DB spinning
+        print(f"FAILED (unexpected): {type(exc).__name__}: {scrub(exc, limit=300)}",
+              file=sys.stderr)
+        reporter.update(STATUS_FAILED, step="Unexpected error")
+        return EXIT_FAIL
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
