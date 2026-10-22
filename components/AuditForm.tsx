@@ -77,7 +77,10 @@ export default function AuditForm({ disabled = false, note }: { disabled?: boole
 
     const res = await createAuditJob(model)
     setSubmitting(false)
+    
     if (!res.ok) {
+      // ✅ सुधार: यह लाइन ब्राउज़र के Console में असली एरर कोड (जैसे: lookup_failed, queue_full) प्रिंट करेगी
+      console.log("👉 REAL BACKEND ERROR CODE IS:", res.code);
       setError(createErrorMessage(res.code))
       return
     }
@@ -153,66 +156,9 @@ export default function AuditForm({ disabled = false, note }: { disabled?: boole
               >
                 <div
                   className="h-2 rounded bg-accent transition-[width] duration-500"
-                  style={{ width: `${Math.min(100, Math.max(0, job.progress))}%` }}
+                  style={{ width: `${job.progress}%` }}
                 />
               </div>
-              <p>
-                {job.step ?? (job.status === 'queued' ? 'Line me hai' : 'Chal raha hai')} · {job.progress}%
-              </p>
-              {job.status === 'queued' && job.queue_position !== null && (
-                <p className="text-muted">Line me number: {job.queue_position}</p>
-              )}
-            </>
-          )}
-
-          <ul className="space-y-1">
-            {job.steps.map((s) => (
-              <li
-                key={s.label}
-                className={s.state === 'done' ? 'text-good' : s.state === 'failed' ? 'text-bad' : 'text-muted'}
-              >
-                [{s.state === 'done' ? '✓' : s.state === 'failed' ? '✗' : s.state === 'running' ? '…' : ' '}] {s.label}
-              </li>
-            ))}
-          </ul>
-
-          {finished && job.status !== 'done' && (
-            <p role="alert" className="text-bad">{jobErrorMessage(job.status, job.error)}</p>
-          )}
-
-          {job.status === 'done' && !result && (
-            <p className="text-bad">Audit poora hua, par numbers nahi mile. Ye report nahi dikhayi ja sakti.</p>
-          )}
-
-          {result && (
-            <>
-              <div className="overflow-x-auto pt-2">
-                <table className="w-full text-left">
-                  <thead>
-                    <tr className="text-muted">
-                      <th className="py-1 pr-3 font-normal">Test set</th>
-                      <th className="py-1 pr-3 font-normal">Variant</th>
-                      <th className="py-1 pr-3 font-normal">KLD (kam = behtar)</th>
-                      <th className="py-1 font-normal">Same top-token</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {Object.entries(result.results).flatMap(([domain, variants]) =>
-                      Object.entries(variants).map(([variant, m]) => (
-                        <tr key={`${domain}-${variant}`} className="border-t border-line">
-                          <td className="py-1.5 pr-3">{domain}</td>
-                          <td className="py-1.5 pr-3">{variant}</td>
-                          <td className="py-1.5 pr-3">{m.kld[0].toFixed(4)} ± {m.kld[1].toFixed(4)}</td>
-                          <td className="py-1.5">{m.top[0].toFixed(1)}% ± {m.top[1].toFixed(1)}</td>
-                        </tr>
-                      )),
-                    )}
-                  </tbody>
-                </table>
-              </div>
-              <p className="pt-2 text-muted">
-                {result.note || 'KLD FP16 se farak hai, task accuracy nahi. Ye ek proxy score hai.'}
-              </p>
             </>
           )}
         </div>
