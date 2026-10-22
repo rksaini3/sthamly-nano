@@ -1,37 +1,48 @@
-import { createClient, type SupabaseClient } from '@supabase/supabase-js'
-import type { Model } from '@/lib/types'
+import { createClient } from '@supabase/supabase-js'
+import type { Model, Results, VariantsMeta } from '@/lib/types'
 
-// Public client: uses the anon key, so it is safe in the browser. 
-// It can only SELECT from `quantization_jobs` and manage basic client handshakes.
-// The service-role key is never used here and must never be put in a NEXT_PUBLIC_ variable.
-let client: SupabaseClient | null = null
-
+// SERVER ONLY. Uses the service-role key. Import only from server components and route handlers.
 export const NOT_CONFIGURED =
-  'Supabase configure nahi hai (NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY).'
+  'Supabase configure nahi hai (NEXT_PUBLIC_SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY).'
 
-export function getClient(): SupabaseClient | null {
+/** Completed calibrate jobs, shaped as the Model type that the leaderboard pages expect. */
+export async function getModels(): Promise<{ models: Model[]; error: string | null }> {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL
-  const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
-  if (!url || !key) return null
-  client ??= createClient(url, key)
-  return client
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY
+  if (!url || !key) return { models: [], error: NOT_CONFIGURED }
+
+  const sb = createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } })
+  const { data, error } = await sb
+    .from('jobs')
+    .select('id, hf_model, kind, result, finished_at, created_at')
+    .eq('status', 'done')
+    .eq('kind', 'calibrate')
+    .order('finished_at', { ascending: false })
+    .limit(200)
+
+  if (error) return { models: [], error: `Supabase se data nahi aaya: ${error.message}` }
+  return { models: (data ?? []).map(toModel), error: null }
 }
 
-/** Never throws: pages show `error` instead of crashing (or silently showing "no models"). */
-export async function getModels(): Promise<{ models: Model[]; error: string | null }> {
-  const sb = getClient()
-  if (!sb) return { models: [], error: NOT_CONFIGURED }
-  
-  // --- FIXED TABLE NAME AND SCHEMATIC CONNECTION MATRIX ---
-  // Maps the historical telemetry data points right off our active quantization_jobs registry
-  const { data, error } = await sb
-    .from('quantization_jobs') // Corrected matching the DB infrastructure specs
-    .select('*')
-    .order('created_at', { ascending: false })
-    .returns<Model[]>()
-    
-  if (error) {
-    return { models: [], error: `Supabase se data nahi aaya: ${error.message}` }
+function toModel(row: any): Model {
+  const r = row.result ?? {}
+  const sizes = r.sizes_gb ?? {}
+  const variantsMeta: VariantsMeta = {
+    standard: { size_gb: sizes.quantized_standard ?? null, source: 'worker' },
+    hindi60: { size_gb: sizes.quantized_hindi ?? null, source: 'worker' },
   }
-  return { models: data ?? [], error: null }
+  return {
+    id: row.id,
+    model_name: row.hf_model,
+    hf_repo: row.hf_model,
+    base_model: row.hf_model,
+    quant_type: 'Q4_K_M',
+    size_gb: sizes.quantized_hindi ?? null,
+    fp16_size_gb: sizes.fp16 ?? null,
+    download_url: null,
+    results: (r.results ?? null) as Results | null,
+    variants_meta: variantsMeta,
+    notes: r.note ?? null,
+    created_at: row.finished_at ?? row.created_at,
+  }
 }
