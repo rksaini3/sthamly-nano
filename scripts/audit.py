@@ -1,32 +1,36 @@
 #!/usr/bin/env python3
 """
-Sthamly NanoBrain - Real Model Audit Engine
+Sthamly NanoBrain - Real Model Audit Engine (v2)
 
-Purpose:
-    Compare one or more quantized GGUF models against an FP16 reference
-    using llama.cpp's llama-perplexity KL-divergence evaluation.
+Compares quantized GGUF models against an FP16 reference using llama.cpp's
+llama-perplexity KL-divergence mode, and writes reports/<slug>/report.json.
 
-Example:
+Example (worker.py calls this exact form):
     python scripts/audit.py \
         --name Qwen/Qwen2.5-1.5B-Instruct \
         --fp16 models/gguf/Qwen__Qwen2.5-1.5B-Instruct-f16.gguf \
         --dataset hindi=data/hindi_test.txt \
-        --quant q4=models/gguf/Qwen__Qwen2.5-1.5B-Instruct-Q4_K_M-standard.gguf \
-        --chunks 100 --pdf
+        --quant q4_standard=models/gguf/...-Q4_K_M-standard.gguf \
+        --quant q4_hindi=models/gguf/...-Q4_K_M-hindi.gguf \
+        --calibration data/hindi_calib.txt \
+        --out reports/qwen__qwen2.5-1.5b-instruct/report.json
 
 Important:
-    - No synthetic KLD values are generated.
-    - Missing metrics cause the audit to fail (ya --allow-partial se baaki results ke saath report).
-    - KLD is a proxy measurement, not proof of task accuracy.
+    - No synthetic metrics. Every number is parsed from llama-perplexity output.
+    - KLD is a proxy for distribution drift, not proof of task accuracy.
+    - Verdicts are computed and written into the report, so the output is
+      self-explanatory.
 
-Exit codes: 0 = sab theek | 1 = fail | 2 = --allow-partial me kuch benchmarks fail hue
+Exit codes:
+    0  complete report, all requested evaluations succeeded
+    1  audit failed (no report written)
+    2  partial report written (--allow-partial and at least one evaluation failed)
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib.util
 import json
 import math
 import os
@@ -35,7 +39,6 @@ import shutil
 import subprocess
 import sys
 import threading
-
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -44,88 +47,76 @@ from typing import Any
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 
-MIN_DATASET_BYTES = 20_000      # isse chhota dataset = kamzor estimate
-OVERLAP_WARN = 0.05             # calibration se >5% lines same -> warning
+MIN_DATASET_BYTES = 20_000
+OVERLAP_WARN = 0.05
 MIN_CHUNKS_WARN = 50
+MAX_CALIBRATION_LINES_FOR_SET = 2_000_000  # memory guard for overlap check
 
+EXIT_OK = 0
+EXIT_FAIL = 1
+EXIT_PARTIAL = 2
 
-# ============================================================
-# ERROR HANDLING
-# ============================================================
 
 class AuditError(RuntimeError):
-    """Raised when a real audit cannot be completed."""
-
-
-def die(message: str, exit_code: int = 1) -> None:
-    print(f"ERROR: {message}", file=sys.stderr)
-    raise SystemExit(exit_code)
+    """A real audit step could not be completed."""
 
 
 # ============================================================
-# SAFE IDENTIFIERS AND PATHS
+# PATHS, NAMES, FILES
 # ============================================================
-
-def slugify(value: str) -> str:
-    result = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip()).strip("-")
-    return result.lower() or "model"
-
 
 def report_directory_name(model_name: str) -> str:
-    """Same convention as worker.py: '/' -> '_' (aur lowercase)."""
-    result = re.sub(r"[^A-Za-z0-9._-]+", "_", model_name.strip()).strip("._-")
-
-    if not result:
+    """
+    Single naming rule shared with worker.py:
+    '/' and unsafe chars -> '_', then lowercase. Must match worker.py exactly.
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", model_name.strip()).strip("._-")
+    if not cleaned:
         raise AuditError("Invalid model name.")
+    return cleaned[:120].lower()
 
-    return result[:120].lower()
+
+def slugify(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip()).strip("-")
+    return cleaned.lower() or "item"
 
 
 def require_file(path: Path, description: str) -> Path:
     if not path.exists():
         raise AuditError(f"{description} does not exist: {path}")
-
     if not path.is_file():
         raise AuditError(f"{description} is not a file: {path}")
-
     if path.stat().st_size <= 0:
         raise AuditError(f"{description} is empty: {path}")
-
     return path.resolve()
 
 
-def safe_model_name(value: str) -> str:
-    if not value or not value.strip():
-        raise AuditError("Model name cannot be empty.")
-
-    if len(value) > 200:
-        raise AuditError("Model name is too long.")
-
-    return value.strip()
+def relative_to_root(path: Path) -> str:
+    """Store relative paths in the report so it works on another machine."""
+    try:
+        return str(path.resolve().relative_to(ROOT))
+    except ValueError:
+        return path.name
 
 
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
-
     with open(path, "rb") as handle:
         for block in iter(lambda: handle.read(1 << 20), b""):
             digest.update(block)
-
     return digest.hexdigest()
 
 
 # ============================================================
-# REAL METRIC PARSING
+# METRIC PARSING (real llama-perplexity output only)
 # ============================================================
 
 NUM = r"([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)"
-# "±" ya ASCII "+/-"; encoding bigad jaye to U+FFFD / mojibake bhi chalega.
 PM = r"\s*(?:±|\+/-|\+\s*/\s*-|\ufffd|Â±)\s*"
 PAIR = NUM + PM + NUM
 
-PATS = {
+PATTERNS = {
     "kld": r"Mean\s+KLD\s*[:=]\s*" + PAIR,
-    # "RMS Δp" ka Δ bigad sakta hai -> label ke beech kuch bhi (max 12 char) chalega
     "rms": r"RMS\s+[^:=\n]{0,12}[:=]\s*" + PAIR,
     "top": r"Same\s+top\s*p\s*[:=]\s*" + PAIR,
     "ppl": r"Mean\s+PPL\(Q\)\s*[:=]\s*" + PAIR,
@@ -133,83 +124,50 @@ PATS = {
 }
 
 
-def parse(text: str) -> dict[str, list[float]]:
+def parse_metrics(text: str) -> dict[str, list[float]]:
     """
-    Parse actual llama-perplexity output.
-
-    Returns {"kld": [mean, error], "rms": [...], "top": [...], "ppl": [...], "ppl_base": [...]}.
-    Metrics absent from the output remain absent.
-    Output me AAKHRI match uthaya jata hai (summary), pehla nahi.
+    Returns {"kld": [mean, error], ...}. Metrics not in the output are absent.
+    The LAST match is used because llama-perplexity prints the summary at the end.
     """
     result: dict[str, list[float]] = {}
-
-    for metric, pattern in PATS.items():
+    for metric, pattern in PATTERNS.items():
         matches = list(re.finditer(pattern, text, flags=re.IGNORECASE))
-
         if not matches:
             continue
-
         try:
             mean = float(matches[-1].group(1))
             error = float(matches[-1].group(2))
         except (TypeError, ValueError):
             continue
-
-        if not math.isfinite(mean) or not math.isfinite(error) or error < 0:
-            continue
-
-        result[metric] = [mean, error]
-
+        if math.isfinite(mean) and math.isfinite(error) and error >= 0:
+            result[metric] = [mean, error]
     return result
 
 
 # ============================================================
-# COMPARISON HELPERS
+# COMPARISON AND VERDICT
 # ============================================================
 
-def gain(a: dict[str, Any], b: dict[str, Any], key: str = "kld") -> tuple[float, float]:
+def compare(a: list[float], b: list[float], key: str) -> tuple[float, float]:
     """
-    Difference between two measured metrics.
-    KLD/RMS: positive gain = model a has a LOWER metric than b.
-    same-top-p: positive gain = model a has a HIGHER metric than b.
-    Returns (difference, combined_error).
+    Returns (gain, combined_error). Positive gain means model A is BETTER.
+    KLD and RMS: lower is better. Same-top-p: higher is better.
+    Errors are combined as if independent (conservative for correlated chunks).
     """
-    if key not in a or key not in b:
-        raise ValueError(f"Metric '{key}' missing from comparison.")
-
-    av, bv = a[key], b[key]
-
-    if not isinstance(av, (list, tuple)) or len(av) != 2:
-        raise ValueError(f"Invalid metric format for a['{key}'].")
-
-    if not isinstance(bv, (list, tuple)) or len(bv) != 2:
-        raise ValueError(f"Invalid metric format for b['{key}'].")
-
-    a_mean, a_error = float(av[0]), float(av[1])
-    b_mean, b_error = float(bv[0]), float(bv[1])
-
-    if not all(math.isfinite(x) for x in (a_mean, a_error, b_mean, b_error)):
-        raise ValueError("Non-finite measurement cannot be compared.")
-
-    if a_error < 0 or b_error < 0:
-        raise ValueError("Measurement errors cannot be negative.")
-
-    difference = (b_mean - a_mean) if key in ("kld", "rms") else (a_mean - b_mean)
-
-    return difference, math.sqrt(a_error ** 2 + b_error ** 2)
+    a_mean, a_err = a
+    b_mean, b_err = b
+    if not all(math.isfinite(x) for x in (a_mean, a_err, b_mean, b_err)):
+        raise AuditError("Non-finite measurement cannot be compared.")
+    gain = (b_mean - a_mean) if key in ("kld", "rms") else (a_mean - b_mean)
+    return gain, math.sqrt(a_err ** 2 + b_err ** 2)
 
 
-def verdict(difference: float, combined_error: float) -> str:
-    if not math.isfinite(difference):
-        return "DATA INVALID"
-
-    if not math.isfinite(combined_error) or combined_error < 0:
-        return "DATA INVALID"
-
-    if difference > 2 * combined_error:
-        return "SAAF FARK"
-
-    return "ISHARA, SAAF NAHI"
+def verdict(gain: float, combined_error: float) -> str:
+    if gain > 2 * combined_error:
+        return "BETTER (gain > 2x combined error)"
+    if gain > 0:
+        return "BETTER BUT WITHIN ERROR"
+    return "NO ADVANTAGE"
 
 
 # ============================================================
@@ -217,26 +175,18 @@ def verdict(difference: float, combined_error: float) -> str:
 # ============================================================
 
 def find_perplexity_binary() -> str:
-    """
-    Priority: LLAMA_PERPLEXITY env (galat ho to seedha error) -> build locations -> PATH.
-    """
     def usable(candidate: str) -> str | None:
         path = Path(candidate).expanduser()
-
         if path.is_file() and (os.name == "nt" or os.access(path, os.X_OK)):
             return str(path.resolve())
-
         return None
 
     configured = os.getenv("LLAMA_PERPLEXITY", "").strip()
-
     if configured:
         found = usable(configured) or shutil.which(configured)
-
         if found:
             return found
-
-        raise AuditError(f"LLAMA_PERPLEXITY chalne layak nahi hai: {configured}")
+        raise AuditError(f"LLAMA_PERPLEXITY is not runnable: {configured}")
 
     for rel in (
         ("llama.cpp", "build", "bin", "llama-perplexity"),
@@ -244,70 +194,50 @@ def find_perplexity_binary() -> str:
         ("llama.cpp", "build", "bin", "Release", "llama-perplexity.exe"),
     ):
         found = usable(str(ROOT.joinpath(*rel)))
-
         if found:
             return found
 
     for name in ("llama-perplexity", "llama-perplexity.exe"):
         found = shutil.which(name)
-
         if found:
             return found
 
     raise AuditError(
-        "llama-perplexity nahi mila. "
-        "llama.cpp build karo ya LLAMA_PERPLEXITY environment variable set karo."
+        "llama-perplexity not found. Build llama.cpp or set LLAMA_PERPLEXITY."
     )
 
 
 # ============================================================
-# DATASET AND QUANT INPUT PARSING
+# NAME=PATH ARGUMENTS
 # ============================================================
 
 def parse_named_paths(values: list[str], argument_name: str) -> dict[str, Path]:
-    """Parse name=path arguments (relative path ROOT se resolve hota hai)."""
     parsed: dict[str, Path] = {}
-
     for value in values:
         if "=" not in value:
-            raise AuditError(
-                f"--{argument_name} value '{value}' invalid hai. Format name=path use karo."
-            )
-
-        name, raw_path = value.split("=", 1)
-        name, raw_path = name.strip(), raw_path.strip()
-
-        if not name:
-            raise AuditError(f"--{argument_name} mein name khaali nahi ho sakta.")
-
+            raise AuditError(f"--{argument_name} value '{value}' must be name=path.")
+        name, raw_path = (part.strip() for part in value.split("=", 1))
         if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", name):
-            raise AuditError(f"--{argument_name} ka name invalid hai: {name}")
-
+            raise AuditError(f"--{argument_name} name is invalid: {name!r}")
         if not raw_path:
-            raise AuditError(f"--{argument_name} mein path khaali nahi ho sakta.")
-
+            raise AuditError(f"--{argument_name} path is empty for {name!r}.")
         if name in parsed:
-            raise AuditError(f"--{argument_name} mein duplicate name hai: {name}")
-
+            raise AuditError(f"--{argument_name} duplicate name: {name}")
         path = Path(raw_path).expanduser()
-
         if not path.is_absolute():
             path = ROOT / path
-
         parsed[name] = path.resolve()
-
     return parsed
 
 
 # ============================================================
-# REAL LLAMA.CPP EVALUATION
+# REAL EVALUATION RUNNER
 # ============================================================
 
-def run_command(command: list[str], timeout: int, log_path: Path | None = None,
-                label: str = "") -> str:
+def run_command(command: list[str], timeout: int, log_path: Path, label: str) -> str:
     """
-    Real evaluation chalao: output LIVE dikhta hai, poora output log file me save hota hai,
-    timeout par process kill hota hai. Non-zero exit = AuditError. Shell use nahi hota.
+    Run llama-perplexity with a real timeout. Output streams live and is saved
+    to log_path. The process is terminated (then killed) on timeout.
     """
     print("\n$ " + " ".join(str(part) for part in command), flush=True)
 
@@ -323,102 +253,108 @@ def run_command(command: list[str], timeout: int, log_path: Path | None = None,
             bufsize=1,
         )
     except OSError as exc:
-        raise AuditError(f"Evaluation command execute nahi hua: {exc}") from exc
+        raise AuditError(f"Could not start evaluator: {exc}") from exc
 
     timed_out = threading.Event()
 
-    def kill() -> None:
+    def stop_process() -> None:
         timed_out.set()
-        process.kill()
+        process.terminate()
+        try:
+            process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            process.kill()
 
-    timer = threading.Timer(timeout, kill)
+    timer = threading.Timer(timeout, stop_process)
     timer.start()
     lines: list[str] = []
 
     try:
+        assert process.stdout is not None
         for line in process.stdout:
             lines.append(line)
             print(line, end="", flush=True)
+        process.wait()
+    except BaseException:
+        process.kill()
+        raise
     finally:
         timer.cancel()
-        process.stdout.close()
-        process.wait()
 
     output = "".join(lines)
 
-    if log_path is not None:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.write_text(
-            f"# {label}\n# CMD: {' '.join(str(x) for x in command)}\n\n{output}",
-            encoding="utf-8",
-        )
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(
+        f"# {label}\n# CMD: {' '.join(str(x) for x in command)}\n\n{output}",
+        encoding="utf-8",
+    )
 
     if timed_out.is_set():
-        raise AuditError(f"Evaluation timeout: {timeout} seconds.")
-
+        raise AuditError(f"Evaluation timed out after {timeout} seconds ({label}).")
     if process.returncode != 0:
         raise AuditError(
-            f"llama-perplexity failed with exit code {process.returncode}. "
-            "Real metrics generate nahi hue."
+            f"llama-perplexity exit code {process.returncode} ({label}). No metric recorded."
         )
-
     return output
 
 
-def ensure_base(*, binary: str, domain: str, dataset_path: Path, fp16_path: Path,
-                common_args: list[str], timeout: int, work_dir: Path, log_dir: Path,
-                fingerprint: dict[str, Any], min_free_gb: float) -> Path:
+def ensure_fp16_base(
+    *,
+    binary: str,
+    domain: str,
+    dataset_path: Path,
+    fp16_path: Path,
+    common_args: list[str],
+    timeout: int,
+    base_dir: Path,
+    log_dir: Path,
+    fingerprint: dict[str, Any],
+    min_free_gb: float,
+) -> Path:
     """
-    FP16 ki base logits file banao ya pichli SAME settings wali reuse karo.
-    Fingerprint (fp16 file, dataset content, chunks, ngl...) badla to purani base nahi chalegi.
-    Base .part me banti hai, isliye adhoori file reuse nahi hoti.
+    Build (or reuse) the FP16 reference logits file for one dataset.
+    Reuse only when the stored fingerprint matches exactly.
+    Written to .part first, renamed on success.
     """
-    work_dir.mkdir(parents=True, exist_ok=True)
-
-    base_path = work_dir / f"{slugify(domain)}_fp16.kld"
-    meta_path = work_dir / f"{slugify(domain)}_fp16.kld.json"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    stem = slugify(domain)
+    base_path = base_dir / f"{stem}_fp16.kld"
+    meta_path = base_dir / f"{stem}_fp16.kld.json"
 
     if base_path.is_file() and base_path.stat().st_size > 0 and meta_path.is_file():
         try:
             if json.loads(meta_path.read_text(encoding="utf-8")) == fingerprint:
-                print(f"[INFO] FP16 base reuse ho raha hai: {base_path.name}")
+                print(f"[INFO] Reusing FP16 base for {domain}: {base_path.name}")
                 return base_path
         except ValueError:
             pass
 
-    free = shutil.disk_usage(work_dir).free / 1e9
-
-    if free < min_free_gb:
+    free_gb = shutil.disk_usage(base_dir).free / 1e9
+    if free_gb < min_free_gb:
         raise AuditError(
-            f"Disk kam hai: {free:.1f} GB free, kam se kam {min_free_gb:g} GB chahiye "
-            "(base logits file badi hoti hai). --chunks kam karo ya disk badhao."
+            f"Not enough disk for FP16 base: {free_gb:.1f} GB free, need {min_free_gb:g} GB."
         )
 
     base_path.unlink(missing_ok=True)
     meta_path.unlink(missing_ok=True)
-
     part = base_path.with_name(base_path.name + ".part")
     part.unlink(missing_ok=True)
 
     command = [binary, "-m", str(fp16_path), "--kl-divergence-base", str(part), *common_args]
-
     try:
-        run_command(command, timeout, log_dir / f"base__{slugify(domain)}.log",
+        run_command(command, timeout, log_dir / f"base__{stem}.log",
                     f"FP16 base logits on {dataset_path.name}")
-
         if not part.is_file() or part.stat().st_size == 0:
             raise AuditError(
-                f"FP16 KLD base generate nahi hua: {base_path}. "
-                "Aapka llama.cpp build --kl-divergence-base support karta hai?"
+                "FP16 base logits were not written. Does this llama.cpp build support "
+                "--kl-divergence-base?"
             )
-
         os.replace(part, base_path)
     except BaseException:
         part.unlink(missing_ok=True)
         raise
 
     meta_path.write_text(json.dumps(fingerprint, indent=2), encoding="utf-8")
-
     return base_path
 
 
@@ -431,138 +367,149 @@ def evaluate_domain(
     quant_models: dict[str, Path],
     chunks: int,
     threads: int,
+    ngl: int | None,
     timeout: int,
-    work_dir: Path,
-    ngl: int | None = None,
-    log_dir: Path | None = None,
-    min_free_gb: float = 5.0,
-    errors: list[str] | None = None,
+    base_dir: Path,
+    log_dir: Path,
+    min_free_gb: float,
+    failures: list[str] | None,
 ) -> list[dict[str, Any]]:
     """
-    Evaluate all quantized models against FP16 for one dataset.
-
-    errors=None  -> pehli fail par AuditError raise (strict).
-    errors=[...] -> fail ko list me daalo aur baaki quants chalate raho (--allow-partial).
+    failures=None  -> first failure raises (strict mode).
+    failures=list  -> record failure and continue with other variants (partial mode).
     """
-    require_file(dataset_path, f"Dataset '{domain}'")
-    require_file(fp16_path, "FP16 reference model")
-
-    log_dir = log_dir or (work_dir / "logs")
-
     common_args = ["-f", str(dataset_path), "-t", str(threads), "--chunks", str(chunks)]
-
     if ngl is not None:
         common_args += ["-ngl", str(ngl)]
 
-    stat = fp16_path.stat()
+    fp16_stat = fp16_path.stat()
+    # Size + mtime, not a full hash: hashing a multi-GB FP16 on every run is too slow.
+    # Drive copy or re-download changes mtime, which only causes a rebuild, never a wrong reuse.
     fingerprint = {
-        "fp16_size": stat.st_size,
-        "fp16_mtime_ns": stat.st_mtime_ns,
+        "fp16_size": fp16_stat.st_size,
+        "fp16_mtime_ns": fp16_stat.st_mtime_ns,
         "dataset_sha256": sha256_file(dataset_path),
         "chunks": chunks,
+        "threads": threads,
+        "ngl": ngl,
     }
 
-    base_path = ensure_base(
+    base_path = ensure_fp16_base(
         binary=binary, domain=domain, dataset_path=dataset_path, fp16_path=fp16_path,
-        common_args=common_args, timeout=timeout, work_dir=work_dir, log_dir=log_dir,
+        common_args=common_args, timeout=timeout, base_dir=base_dir, log_dir=log_dir,
         fingerprint=fingerprint, min_free_gb=min_free_gb,
     )
 
-    domain_results: list[dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
 
     for variant, quant_path in quant_models.items():
+        label = f"{variant} vs FP16 on {dataset_path.name}"
         try:
             require_file(quant_path, f"Quantized model '{variant}'")
-
-            command = [
-                binary, "-m", str(quant_path),
-                "--kl-divergence-base", str(base_path),
-                "--kl-divergence", *common_args,
-            ]
-
             output = run_command(
-                command, timeout, log_dir / f"{slugify(variant)}__{slugify(domain)}.log",
-                f"{quant_path.name} vs FP16 on {dataset_path.name}",
+                [binary, "-m", str(quant_path), "--kl-divergence-base", str(base_path),
+                 "--kl-divergence", *common_args],
+                timeout,
+                log_dir / f"{slugify(variant)}__{slugify(domain)}.log",
+                label,
             )
-            metrics = parse(output)
-
+            metrics = parse_metrics(output)
             if "kld" not in metrics:
-                raise AuditError(
-                    f"'{variant}' ke liye actual KLD metric parse nahi hua. "
-                    "Report ko successful mark nahi kiya gaya."
-                )
+                raise AuditError(f"Mean KLD not found in output for '{variant}' on '{domain}'.")
         except AuditError as exc:
-            if errors is None:
+            if failures is None:
                 raise
-
             message = f"[{variant} x {domain}] {exc}"
             print(f"ERROR: {message}", file=sys.stderr)
-            errors.append(message)
+            failures.append(message)
             continue
 
         item: dict[str, Any] = {
             "domain": domain,
             "variant": variant,
-            "model_path": str(quant_path),
+            "model_path": relative_to_root(quant_path),
             "kld": metrics["kld"][0],
             "kld_error": metrics["kld"][1],
+            "metrics_missing": sorted(set(PATTERNS) - set(metrics)),
         }
-
-        for key, (field, field_err) in {
+        field_map = {
             "rms": ("rms", "rms_error"),
             "top": ("same_top_p", "same_top_p_error"),
             "ppl": ("ppl", "ppl_error"),
             "ppl_base": ("ppl_base", "ppl_base_error"),
-        }.items():
+        }
+        for key, (field, field_err) in field_map.items():
             if key in metrics:
                 item[field] = metrics[key][0]
                 item[field_err] = metrics[key][1]
+        results.append(item)
 
-        domain_results.append(item)
-
-    return domain_results
+    return results
 
 
 # ============================================================
-# DATA-VALIDITY CHECKS
+# DATA VALIDITY CHECKS
 # ============================================================
 
-def nonempty_lines(path: Path) -> set[str]:
-    text = path.read_text(encoding="utf-8", errors="replace")
-    return {line.strip() for line in text.splitlines() if line.strip()}
+def line_set(path: Path) -> set[str] | None:
+    """
+    Set of non-empty lines for overlap checks. Returns None if the file is too large
+    to hold in memory; the caller then reports overlap as unchecked.
+    """
+    lines: set[str] = set()
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        for raw in handle:
+            line = raw.strip()
+            if line:
+                lines.add(line)
+                if len(lines) > MAX_CALIBRATION_LINES_FOR_SET:
+                    return None
+    return lines
 
 
-def dataset_checks(datasets: dict[str, Path], calibration: Path | None) -> tuple[dict[str, Any], list[str]]:
+def dataset_checks(
+    datasets: dict[str, Path],
+    calibration: Path | None,
+) -> tuple[dict[str, Any], list[str]]:
     info: dict[str, Any] = {}
     warnings: list[str] = []
+
     calib_sha = sha256_file(calibration) if calibration else None
-    calib_lines = nonempty_lines(calibration) if calibration else set()
+    calib_lines = line_set(calibration) if calibration else None
+    if calibration and calib_lines is None:
+        warnings.append("Calibration file too large for overlap check; overlap is UNCHECKED.")
 
     for name, path in datasets.items():
         size = path.stat().st_size
-        entry: dict[str, Any] = {"file": str(path), "bytes": size, "sha256": sha256_file(path)}
+        entry: dict[str, Any] = {
+            "file": relative_to_root(path),
+            "bytes": size,
+            "sha256": sha256_file(path),
+        }
 
         if size < MIN_DATASET_BYTES:
             warnings.append(
-                f"Dataset '{name}' chhota hai ({size} bytes < {MIN_DATASET_BYTES}); KLD estimates kamzor ho sakte hain."
+                f"Dataset '{name}' is small ({size} bytes < {MIN_DATASET_BYTES}); estimates are weak."
             )
 
         if calibration is not None:
             if entry["sha256"] == calib_sha:
                 entry["calibration_overlap"] = 1.0
                 warnings.append(
-                    f"Dataset '{name}' calibration (imatrix) file ke BILKUL same hai -- 'before vs after' valid nahi."
+                    f"Dataset '{name}' is identical to the calibration file; "
+                    "before/after comparison is not a fair test."
                 )
-            else:
-                lines = nonempty_lines(path)
+            elif calib_lines is not None:
+                lines = line_set(path) or set()
                 overlap = len(lines & calib_lines) / len(lines) if lines else 0.0
                 entry["calibration_overlap"] = round(overlap, 4)
-
                 if overlap > OVERLAP_WARN:
                     warnings.append(
-                        f"Dataset '{name}' ki {overlap:.0%} lines calibration file se milti hain; "
-                        "imatrix quant ko unfair fayda mil sakta hai. Held-out dataset use karo."
+                        f"Dataset '{name}': {overlap:.0%} of lines also appear in calibration; "
+                        "use a held-out dataset."
                     )
+            else:
+                entry["calibration_overlap"] = None
 
         info[name] = entry
 
@@ -570,8 +517,53 @@ def dataset_checks(datasets: dict[str, Path], calibration: Path | None) -> tuple
 
 
 # ============================================================
-# REPORT GENERATION
+# REPORT
 # ============================================================
+
+def build_comparisons(results: list[dict[str, Any]], variants: list[str]) -> list[dict[str, Any]]:
+    """
+    Pairwise comparison of every variant against the first variant named on the
+    command line (the baseline). Computed here, so the report contains verdicts.
+    """
+    comparisons: list[dict[str, Any]] = []
+    if len(variants) < 2:
+        return comparisons
+
+    by_key = {(r["domain"], r["variant"]): r for r in results}
+    domains = sorted({r["domain"] for r in results})
+    baseline = variants[0]
+
+    for domain in domains:
+        base = by_key.get((domain, baseline))
+        if base is None:
+            continue
+        for other in variants[1:]:
+            cand = by_key.get((domain, other))
+            if cand is None:
+                continue
+            for key in ("kld", "rms", "same_top_p"):
+                metric_key = {"kld": "kld", "rms": "rms", "same_top_p": "same_top_p"}[key]
+                if metric_key not in base or metric_key not in cand:
+                    continue
+                mkey = {"kld": "kld", "rms": "rms", "same_top_p": "top"}[key]
+                gain, err = compare(
+                    [base[metric_key], base[f"{metric_key}_error"] if metric_key != "same_top_p"
+                     else base["same_top_p_error"]],
+                    [cand[metric_key], cand[f"{metric_key}_error"] if metric_key != "same_top_p"
+                     else cand["same_top_p_error"]],
+                    mkey,
+                )
+                comparisons.append({
+                    "domain": domain,
+                    "baseline": baseline,
+                    "candidate": other,
+                    "metric": key,
+                    "gain_for_candidate": round(-gain if mkey in ("kld", "rms") else gain, 6),
+                    "combined_error": round(err, 6),
+                    "verdict": verdict(gain, err),
+                })
+    return comparisons
+
 
 def write_report(
     *,
@@ -580,67 +572,79 @@ def write_report(
     datasets: dict[str, Path],
     quant_models: dict[str, Path],
     results: list[dict[str, Any]],
+    comparisons: list[dict[str, Any]],
     chunks: int,
     threads: int,
-    ngl: int | None = None,
-    dataset_info: dict[str, Any] | None = None,
-    audit_warnings: list[str] | None = None,
-    errors: list[str] | None = None,
+    ngl: int | None,
+    dataset_info: dict[str, Any],
+    audit_warnings: list[str],
+    failures: list[str],
+    calibration: Path | None,
+    out_path: Path | None,
 ) -> Path:
-    """report.json atomically likho (pehle .tmp, phir rename)."""
     report_dir = ROOT / "reports" / report_directory_name(model_name)
-    report_dir.mkdir(parents=True, exist_ok=True)
+    report_path = out_path or (report_dir / "report.json")
+    report_path.parent.mkdir(parents=True, exist_ok=True)
 
-    report_path = report_dir / "report.json"
+    missing_domains = sorted(set(datasets) - {r["domain"] for r in results})
 
-    report = {
-        "schema_version": 1,
+    report: dict[str, Any] = {
+        "schema_version": 2,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "target_model": model_name,
-        "fp16_model": str(fp16_path),
+        "status": "partial" if failures else "complete",
+        "fp16_model": relative_to_root(fp16_path),
         "fp16_size_gb": round(fp16_path.stat().st_size / 1e9, 4),
-        "datasets": dataset_info if dataset_info else {n: str(p) for n, p in datasets.items()},
-        "quantized_models": {n: str(p) for n, p in quant_models.items()},
+        "datasets": dataset_info,
+        "calibration_file": relative_to_root(calibration) if calibration else None,
+        "quantized_models": {n: relative_to_root(p) for n, p in quant_models.items()},
         "quantized_sizes_gb": {
             n: round(p.stat().st_size / 1e9, 4) for n, p in quant_models.items() if p.is_file()
         },
         "settings": {"chunks": chunks, "threads": threads, "ngl": ngl},
         "results": results,
-        "audit_warnings": audit_warnings or [],
-        "errors": errors or [],
+        "comparisons": comparisons,
+        "missing_domains": missing_domains,
+        "audit_warnings": audit_warnings,
+        "failures": failures,
         "measurement_notes": [
-            "Measurements were parsed from llama-perplexity output.",
-            "KLD measures divergence from the FP16 reference.",
-            "Lower KLD indicates closer measured output distribution.",
-            "These measurements do not establish general task accuracy.",
-            "No legal or regulatory compliance certification is implied.",
+            "Every number was parsed from llama-perplexity output in this run.",
+            "KLD measures divergence from the FP16 reference on the given dataset.",
+            "Lower KLD means closer output distribution to FP16.",
+            "Comparison errors assume independence, which is conservative for correlated chunks.",
+            "These measurements do not establish task accuracy or regulatory compliance.",
         ],
     }
 
-    temporary_path = report_path.with_suffix(".json.tmp")
-
-    temporary_path.write_text(
+    tmp_path = report_path.with_name(report_path.name + ".tmp")
+    tmp_path.write_text(
         json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False),
         encoding="utf-8",
     )
-    temporary_path.replace(report_path)
-
+    os.replace(tmp_path, report_path)
     return report_path
 
 
 def build_pdf(report_path: Path) -> Path | None:
-    """make_pdf.py chalao. PDF fail ho to audit fail nahi hota (report.json already safe hai)."""
+    """Run make_pdf.py as a separate process so its import side effects cannot touch audit."""
     script = HERE / "make_pdf.py"
-
-    try:
-        spec = importlib.util.spec_from_file_location("sthamly_make_pdf", script)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module.make_pdf(report_path)
-    except Exception as exc:
-        print(f"[WARN] PDF nahi bani ({type(exc).__name__}: {exc}). report.json safe hai; "
-              f"baad me: python scripts/make_pdf.py --report {report_path}", file=sys.stderr)
+    if not script.is_file():
+        print("[WARN] make_pdf.py not found; skipping PDF.", file=sys.stderr)
         return None
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(script), "--report", str(report_path)],
+            cwd=str(ROOT), capture_output=True, text=True, timeout=600, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"[WARN] PDF step failed: {exc}. report.json is safe.", file=sys.stderr)
+        return None
+    if completed.returncode != 0:
+        print(f"[WARN] PDF step exit {completed.returncode}. report.json is safe.\n"
+              f"{completed.stderr[-400:]}", file=sys.stderr)
+        return None
+    pdf = report_path.with_suffix(".pdf")
+    return pdf if pdf.is_file() else None
 
 
 # ============================================================
@@ -649,90 +653,79 @@ def build_pdf(report_path: Path) -> Path | None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sthamly NanoBrain real GGUF audit engine.")
-
-    parser.add_argument("--name", required=True, help="Model ID/name, e.g. Qwen/Qwen2.5-1.5B-Instruct")
-    parser.add_argument("--fp16", required=True, help="Path to the FP16 reference GGUF.")
+    parser.add_argument("--name", required=True, help="Model ID, e.g. Qwen/Qwen2.5-1.5B-Instruct")
+    parser.add_argument("--fp16", required=True, help="FP16 reference GGUF.")
     parser.add_argument("--dataset", action="append", required=True,
-                        help="Dataset in name=path format. Repeat for multiple datasets.")
+                        help="name=path. Repeat for multiple datasets.")
     parser.add_argument("--quant", action="append", required=True,
-                        help="Quantized GGUF in name=path format. Repeat for variants.")
-    parser.add_argument("--chunks", type=int, default=100,
-                        help=f"Evaluation chunks (default 100; <{MIN_CHUNKS_WARN} = rough estimate).")
-    parser.add_argument("--threads", type=int, default=max(1, min(os.cpu_count() or 2, 4)),
-                        help="CPU threads for llama-perplexity.")
-    parser.add_argument("--ngl", type=int, default=99,
-                        help="GPU layers (-ngl). GPU (RunPod) par 99; CPU-only par 0.")
-    parser.add_argument("--timeout", type=int, default=10800,
-                        help="Timeout in seconds for each evaluation command.")
+                        help="name=path. The FIRST --quant is the baseline for comparisons.")
     parser.add_argument("--calibration", default=None,
-                        help="imatrix calibration text file; test dataset se overlap ho to warning.")
-    parser.add_argument("--min-free-gb", type=float, default=5.0,
-                        help="FP16 base file banane se pehle itna free disk chahiye.")
+                        help="imatrix calibration text; overlap with datasets is checked.")
+    parser.add_argument("--out", default=None,
+                        help="Exact report.json path (worker.py uses this). Default: reports/<slug>/report.json")
+    parser.add_argument("--chunks", type=int, default=100)
+    parser.add_argument("--threads", type=int, default=max(1, min(os.cpu_count() or 2, 4)))
+    parser.add_argument("--ngl", type=int, default=99,
+                        help="GPU layers. 99 on a GPU box, 0 for CPU only.")
+    parser.add_argument("--timeout", type=int, default=10800,
+                        help="Seconds allowed for each llama-perplexity run.")
+    parser.add_argument("--min-free-gb", type=float, default=5.0)
     parser.add_argument("--allow-partial", action="store_true",
-                        help="Kuch benchmarks fail hon to bhi baaki ke saath report likho (exit code 2).")
-    parser.add_argument("--pdf", action="store_true",
-                        help="Report ke baad developer PDF bhi banao (scripts/make_pdf.py).")
-
+                        help="Write a partial report if some evaluations fail (exit code 2).")
+    parser.add_argument("--pdf", action="store_true")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
-    if args.chunks < 1 or args.chunks > 100000:
-        die("--chunks 1 se 100000 ke beech hona chahiye.", 2)
-
-    if args.threads < 1 or args.threads > 256:
-        die("--threads 1 se 256 ke beech hona chahiye.", 2)
-
-    if args.ngl < 0:
-        die("--ngl negative nahi ho sakta.", 2)
-
-    if args.timeout < 1:
-        die("--timeout positive number hona chahiye.", 2)
+    if not 1 <= args.chunks <= 100_000:
+        print("ERROR: --chunks must be between 1 and 100000.", file=sys.stderr)
+        return EXIT_FAIL
+    if not 1 <= args.threads <= 256:
+        print("ERROR: --threads must be between 1 and 256.", file=sys.stderr)
+        return EXIT_FAIL
+    if args.ngl < 0 or args.timeout < 1:
+        print("ERROR: --ngl must be >= 0 and --timeout >= 1.", file=sys.stderr)
+        return EXIT_FAIL
 
     try:
-        model_name = safe_model_name(args.name)
+        model_name = args.name.strip()
+        if not model_name or len(model_name) > 200:
+            raise AuditError("Model name is empty or too long.")
 
         fp16_path = Path(args.fp16).expanduser()
-
         if not fp16_path.is_absolute():
             fp16_path = ROOT / fp16_path
-
         fp16_path = require_file(fp16_path.resolve(), "FP16 reference model")
 
         datasets = parse_named_paths(args.dataset, "dataset")
         quant_models = parse_named_paths(args.quant, "quant")
 
-        for domain, dataset_path in datasets.items():
-            require_file(dataset_path, f"Dataset '{domain}'")
-
-        for variant, quant_path in quant_models.items():
-            require_file(quant_path, f"Quantized model '{variant}'")
-
-            if quant_path == fp16_path:
-                raise AuditError(f"--quant '{variant}' aur --fp16 ek hi file hain.")
+        for name, path in datasets.items():
+            require_file(path, f"Dataset '{name}'")
+        for name, path in quant_models.items():
+            require_file(path, f"Quantized model '{name}'")
+            if path == fp16_path:
+                raise AuditError(f"--quant '{name}' is the same file as --fp16.")
 
         calibration = None
-
         if args.calibration:
             cpath = Path(args.calibration).expanduser()
-            calibration = require_file(cpath if cpath.is_absolute() else ROOT / cpath, "Calibration file")
+            calibration = require_file(cpath if cpath.is_absolute() else ROOT / cpath,
+                                       "Calibration file")
 
         binary = find_perplexity_binary()
         dataset_info, audit_warnings = dataset_checks(datasets, calibration)
 
         fp16_size = fp16_path.stat().st_size
-
-        for variant, quant_path in quant_models.items():
-            if quant_path.stat().st_size >= fp16_size:
-                audit_warnings.append(
-                    f"Quant '{variant}' FP16 se chhota nahi hai -- files ka order/jodi check karo."
-                )
+        for name, path in quant_models.items():
+            if path.stat().st_size >= fp16_size:
+                audit_warnings.append(f"Quant '{name}' is not smaller than FP16; check file pairing.")
 
         if args.chunks < MIN_CHUNKS_WARN:
             audit_warnings.append(
-                f"Sirf {args.chunks} chunks evaluate hue (< {MIN_CHUNKS_WARN}); numbers rough estimate hain."
+                f"Only {args.chunks} chunks (< {MIN_CHUNKS_WARN}); numbers are a rough estimate."
             )
 
         for text in audit_warnings:
@@ -741,41 +734,49 @@ def main(argv: list[str] | None = None) -> int:
         print("=" * 64)
         print("STHAMLY NANOBRAIN - REAL MODEL AUDIT")
         print("=" * 64)
-        print(f"Model: {model_name}")
-        print(f"FP16: {fp16_path}")
-        print(f"Datasets: {len(datasets)}")
-        print(f"Quantized variants: {len(quant_models)}")
+        print(f"Model:    {model_name}")
+        print(f"FP16:     {fp16_path}")
+        print(f"Datasets: {', '.join(datasets)}")
+        print(f"Variants: {', '.join(quant_models)} (baseline: {next(iter(quant_models))})")
         print(f"Evaluator: {binary}")
-        print("Synthetic metrics: DISABLED")
         print("=" * 64)
 
+        work_root = ROOT / "work" / "audit" / slugify(model_name)
+        log_dir = work_root / "logs"
+        base_dir = work_root / "base"
+
         all_results: list[dict[str, Any]] = []
-        errors: list[str] = []
-        sink = errors if args.allow_partial else None
+        failures: list[str] = []
+        sink = failures if args.allow_partial else None
 
         for domain, dataset_path in datasets.items():
             print(f"\nEvaluating dataset: {domain}")
-
-            all_results.extend(
-                evaluate_domain(
-                    binary=binary,
-                    domain=domain,
-                    dataset_path=dataset_path,
-                    fp16_path=fp16_path,
-                    quant_models=quant_models,
-                    chunks=args.chunks,
-                    threads=args.threads,
-                    timeout=args.timeout,
-                    work_dir=ROOT / "work" / "audit" / slugify(model_name),
-                    ngl=args.ngl,
-                    log_dir=ROOT / "reports" / report_directory_name(model_name) / "logs",
-                    min_free_gb=args.min_free_gb,
-                    errors=sink,
-                )
-            )
+            all_results.extend(evaluate_domain(
+                binary=binary,
+                domain=domain,
+                dataset_path=dataset_path,
+                fp16_path=fp16_path,
+                quant_models=quant_models,
+                chunks=args.chunks,
+                threads=args.threads,
+                ngl=args.ngl,
+                timeout=args.timeout,
+                base_dir=base_dir,
+                log_dir=log_dir,
+                min_free_gb=args.min_free_gb,
+                failures=sink,
+            ))
 
         if not all_results:
-            raise AuditError("Koi real evaluation result nahi mila. Report nahi banegi.")
+            raise AuditError("No real evaluation result was produced. No report written.")
+
+        comparisons = build_comparisons(all_results, list(quant_models))
+
+        out_path = None
+        if args.out:
+            out_path = Path(args.out).expanduser()
+            if not out_path.is_absolute():
+                out_path = ROOT / out_path
 
         report_path = write_report(
             model_name=model_name,
@@ -783,38 +784,44 @@ def main(argv: list[str] | None = None) -> int:
             datasets=datasets,
             quant_models=quant_models,
             results=all_results,
+            comparisons=comparisons,
             chunks=args.chunks,
             threads=args.threads,
             ngl=args.ngl,
             dataset_info=dataset_info,
             audit_warnings=audit_warnings,
-            errors=errors,
+            failures=failures,
+            calibration=calibration,
+            out_path=out_path.resolve() if out_path else None,
         )
 
         print("\n" + "=" * 64)
-        print("AUDIT COMPLETE" if not errors else "AUDIT PARTIAL")
+        print("AUDIT PARTIAL" if failures else "AUDIT COMPLETE")
         print("=" * 64)
-
         for item in all_results:
-            print(f"{item['domain']} / {item['variant']}: KLD={item['kld']:.6f} ± {item['kld_error']:.6f}")
+            print(f"{item['domain']} / {item['variant']}: "
+                  f"KLD={item['kld']:.6f} ± {item['kld_error']:.6f}")
+        for comp in comparisons:
+            print(f"{comp['domain']}: {comp['candidate']} vs {comp['baseline']} "
+                  f"[{comp['metric']}] gain={comp['gain_for_candidate']:+.6f} "
+                  f"err={comp['combined_error']:.6f} -> {comp['verdict']}")
 
         print(f"\nReport: {report_path}")
-        print("Note: KLD is a proxy metric, not task-accuracy proof.")
+        print("Note: KLD is a proxy metric, not proof of task accuracy.")
 
         if args.pdf:
             pdf_path = build_pdf(report_path)
-
             if pdf_path:
                 print(f"PDF: {pdf_path}")
 
-        return 2 if errors else 0
+        return EXIT_PARTIAL if failures else EXIT_OK
 
     except AuditError as exc:
         print(f"AUDIT FAILED: {exc}", file=sys.stderr)
-        return 1
+        return EXIT_FAIL
     except (OSError, ValueError, TypeError) as exc:
         print(f"AUDIT FAILED: {type(exc).__name__}: {exc}", file=sys.stderr)
-        return 1
+        return EXIT_FAIL
 
 
 if __name__ == "__main__":
