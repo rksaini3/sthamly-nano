@@ -100,7 +100,7 @@ const CREATE_ERRORS: Record<string, string> = {
 
 /** Message for an error code returned by create_audit_job (anything unknown gets a generic line). */
 export function createErrorMessage(code: string): string {
-  return CREATE_ERRORS[code] ?? 'Kuch gadbad hui. Thodi der baad dobara try karo.'
+  return CREATE_ERRORS[code] ?? `Kuch gadbad hui (${code}). Thodi der baad dobara try karo.`
 }
 
 /**
