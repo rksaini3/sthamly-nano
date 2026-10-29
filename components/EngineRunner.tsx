@@ -193,10 +193,18 @@ export default function EngineRunner() {
           </section>
 
           <section>
-            <button onClick={downloadVerilog}
-              className="rounded border border-brand px-4 py-2 font-semibold text-brand">
-              Download Verilog (.v)
-            </button>
+            <div className="flex flex-wrap gap-3">
+              <button onClick={downloadVerilog}
+                className="rounded border border-brand px-4 py-2 font-semibold text-brand">
+                Download Verilog (.v)
+              </button>
+              <a
+                href={`${API}/report.pdf?rows=${data.placement.grid.rows}&cols=${data.placement.grid.cols}`}
+                className="rounded border border-brand px-4 py-2 font-semibold text-brand"
+              >
+                Download PDF report
+              </a>
+            </div>
             <ul className="mt-6 list-disc space-y-1 pl-5 text-sm text-muted">
               {data.report.not_claimed.map((t) => (
                 <li key={t}>{t}</li>
