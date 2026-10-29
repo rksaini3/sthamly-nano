@@ -1,0 +1,190 @@
+import json
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torchvision import datasets
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+
+from engine.quantizer.accuracy_check import verdict  # noqa: E402
+from samples.sample_model import MLP, CKPT  # noqa: E402
+
+INPUT_MAX = 127   # pixel in [0,1] -> integer 0..127
+ACT_MAX = 127     # hidden activations after ReLU -> integer 0..127
+SHIFT = 31        # fixed-point shift for requantization
+
+
+@dataclass
+class IntLayer:
+    name: str
+    in_features: int
+    out_features: int
+    w_q: np.ndarray   # int8, shape [out, in]; values fit in w_bits
+    b_q: np.ndarray   # int32, shape [out]
+    m: int            # requant multiplier (0 for the last layer)
+    shift: int        # requant shift (0 for the last layer)
+    relu: bool        # True: ReLU + requantize to 0..127; False: raw logits
+
+
+@dataclass
+class IntModel:
+    w_bits: int
+    input_max: int
+    layers: List[IntLayer]
+
+
+def _linears(model: nn.Module):
+    """Return [(name, Linear)] and check the pattern Linear, ReLU, ..., Linear."""
+    leaves = [(n, m) for n, m in model.named_modules()
+              if len(list(m.children())) == 0 and not isinstance(m, nn.Flatten)]
+    for i, (_, m) in enumerate(leaves):
+        if i % 2 == 0 and not isinstance(m, nn.Linear):
+            raise ValueError("expected Linear at position %d" % i)
+        if i % 2 == 1 and not isinstance(m, nn.ReLU):
+            raise ValueError("expected ReLU at position %d" % i)
+    if len(leaves) % 2 == 0:
+        raise ValueError("model must end with a Linear layer")
+    return [(n, m) for n, m in leaves if isinstance(m, nn.Linear)]
+
+
+@torch.no_grad()
+def _calibrate(linears, x: torch.Tensor) -> List[float]:
+    """99.9th percentile of positive hidden activations, per hidden layer."""
+    maxima = []
+    a = x
+    for i, (_, lin) in enumerate(linears):
+        a = a @ lin.weight.T + (lin.bias if lin.bias is not None else 0)
+        if i < len(linears) - 1:
+            a = torch.relu(a)
+            pos = a[a > 0].numpy()
+            if pos.size == 0:
+                raise ValueError("hidden layer %d is all zeros on calibration data" % i)
+            maxima.append(float(np.percentile(pos, 99.9)))
+    return maxima
+
+
+def build_int_model(model: nn.Module, w_bits: int, calib_x: torch.Tensor) -> IntModel:
+    """
+    Weights: symmetric per-layer, w_bits (8 or 4).
+    Activations: always 8-bit (input 0..127, hidden 0..127). So INT4 means W4A8.
+    calib_x: float tensor [N, in_features] in [0,1], used only to choose
+    the hidden activation scale.
+    """
+    if w_bits not in (4, 8):
+        raise ValueError("w_bits must be 4 or 8")
+    model.eval()
+    linears = _linears(model)
+    maxima = _calibrate(linears, calib_x)
+
+    qmax = 2 ** (w_bits - 1) - 1
+    s_in = 1.0 / INPUT_MAX
+    layers: List[IntLayer] = []
+
+    for i, (name, lin) in enumerate(linears):
+        w = lin.weight.detach().numpy().astype(np.float64)
+        b = (lin.bias.detach().numpy().astype(np.float64)
+             if lin.bias is not None else np.zeros(w.shape[0]))
+        s_w = max(float(np.abs(w).max()), 1e-12) / qmax
+        w_q = np.clip(np.rint(w / s_w), -qmax - 1, qmax).astype(np.int8)
+        b_q = np.rint(b / (s_w * s_in)).astype(np.int64)
+        if np.abs(b_q).max() >= 2 ** 31:
+            raise ValueError("bias overflows int32 in layer %s" % name)
+
+        last = i == len(linears) - 1
+        if last:
+            m, shift = 0, 0
+        else:
+            s_out = maxima[i] / ACT_MAX
+            M = s_w * s_in / s_out
+            if not (0.0 < M < 0.999):
+                raise ValueError("requant factor %.6f out of range in layer %s" % (M, name))
+            m = int(round(M * (1 << SHIFT)))
+            shift = SHIFT
+            s_in = s_out
+
+        layers.append(IntLayer(name, w.shape[1], w.shape[0], w_q,
+                               b_q.astype(np.int32), m, shift, not last))
+
+    return IntModel(w_bits=w_bits, input_max=INPUT_MAX, layers=layers)
+
+
+def quantize_input(x_float: np.ndarray) -> np.ndarray:
+    """Pixels in [0,1] -> int64 in 0..127."""
+    return np.rint(x_float * INPUT_MAX).astype(np.int64)
+
+
+def forward_int(im: IntModel, x_q: np.ndarray) -> np.ndarray:
+    """
+    Integer-only inference, bit-exact reference for the Verilog.
+    x_q: int64 [B, in]. Returns int64 logits [B, out_last].
+    """
+    a = x_q.astype(np.int64)
+    for L in im.layers:
+        acc = a @ L.w_q.astype(np.int64).T + L.b_q.astype(np.int64)
+        if np.abs(acc).max() >= 2 ** 31:
+            raise OverflowError("accumulator overflow in layer %s" % L.name)
+        if L.relu:
+            v = (acc * L.m + (1 << (L.shift - 1))) >> L.shift   # arithmetic shift
+            a = np.clip(v, 0, ACT_MAX)
+        else:
+            a = acc
+    return a
+
+
+def predict_int(im: IntModel, x_float: np.ndarray):
+    """Returns (class ids, logits). Ties go to the lowest index."""
+    logits = forward_int(im, quantize_input(x_float))
+    return logits.argmax(axis=1), logits
+
+
+def load_mnist(train: bool):
+    ds = datasets.MNIST(str(ROOT / "data" / "mnist"), train=train, download=True)
+    x = ds.data.numpy().reshape(-1, 784).astype(np.float32) / 255.0
+    y = ds.targets.numpy()
+    return x, y
+
+
+def _acc_se(pred: np.ndarray, y: np.ndarray):
+    acc = float((pred == y).mean())
+    return acc, float(np.sqrt(acc * (1 - acc) / len(y)))
+
+
+def main():
+    model = MLP()
+    model.load_state_dict(torch.load(CKPT))
+    model.eval()
+
+    x_train, _ = load_mnist(train=True)
+    calib = torch.from_numpy(x_train[:2000])
+    x_test, y_test = load_mnist(train=False)
+
+    with torch.no_grad():
+        fp_pred = model(torch.from_numpy(x_test).view(-1, 1, 28, 28)).argmax(1).numpy()
+    acc0, se0 = _acc_se(fp_pred, y_test)
+    rows = [{"name": "FP32", "acc": acc0, "se": se0, "verdict": "baseline"}]
+
+    for wb in (8, 4):
+        im = build_int_model(model, wb, calib)
+        pred, _ = predict_int(im, x_test)
+        acc, se = _acc_se(pred, y_test)
+        rows.append({"name": f"W{wb}A8", "acc": acc, "se": se,
+                     "verdict": verdict(acc0, se0, acc, se)})
+
+    print(f"{'model':8} {'accuracy':>10} {'± se':>8}  verdict")
+    for r in rows:
+        print(f"{r['name']:8} {r['acc'] * 100:9.2f}% {r['se'] * 100:7.2f}%  {r['verdict']}")
+
+    out = ROOT / "results" / "engine_int_mnist.json"
+    out.parent.mkdir(exist_ok=True)
+    out.write_text(json.dumps(rows, indent=2))
+    print("saved", out)
+
+
+if __name__ == "__main__":
+    main()
