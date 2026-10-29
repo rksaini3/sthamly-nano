@@ -1,0 +1,50 @@
+from dataclasses import dataclass
+from typing import List
+
+from engine.mapper.placement import Placement
+
+
+@dataclass
+class FrameConfig:
+    layer_index: int
+    layer_name: str
+    kind: str
+    active_pes: int
+    passes: int
+    mask_int: int      # bit i = 1 means PE i is active (PE 0 = LSB)
+    mask_hex: str      # same mask as hex text, zero-padded
+    width: int         # total bits = rows * cols
+
+    def verilog_literal(self) -> str:
+        """Example: 64'hffffffffffffffff"""
+        return f"{self.width}'h{self.mask_hex}"
+
+
+def frame_to_mask(cells: List) -> int:
+    """cells[i] is a layer index (active) or None (idle) -> integer bitmask."""
+    mask = 0
+    for i, c in enumerate(cells):
+        if c is not None:
+            mask |= 1 << i
+    return mask
+
+
+def build_config(placement: Placement) -> List[FrameConfig]:
+    """One FrameConfig per compute layer, in execution order."""
+    width = placement.grid.size
+    hex_digits = (width + 3) // 4
+    out: List[FrameConfig] = []
+
+    for frame, passes in zip(placement.frames, placement.passes):
+        mask = frame_to_mask(frame.cells)
+        out.append(FrameConfig(
+            layer_index=frame.layer_index,
+            layer_name=frame.layer_name,
+            kind=frame.kind,
+            active_pes=frame.active_pes,
+            passes=passes,
+            mask_int=mask,
+            mask_hex=format(mask, f"0{hex_digits}x"),
+            width=width,
+        ))
+    return out
