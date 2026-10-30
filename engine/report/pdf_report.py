@@ -51,7 +51,7 @@ def make_pdf(report: Dict, out_path: str) -> str:
     rows = [[Paragraph(c, head) for c in cols]]
     for r in report["results"]:
         tech = "graphene (what-if)" if r["tech"] == "graphene_what_if" else "silicon FPGA"
-        rows.append([Paragraph(str(x), cell) for x in (
+        rows.append([Paragraph(escape(str(x)), cell) for x in (
             r["precision"],
             tech,
             f"{r['accuracy'] * 100:.2f}% +/- {r['accuracy_se'] * 100:.2f} ({r['accuracy_verdict']})",
@@ -74,11 +74,50 @@ def make_pdf(report: Dict, out_path: str) -> str:
         ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f3f4f6")]),
     ]))
     story.append(t)
-    story.append(Spacer(1, 6 * mm))
 
+    # what each precision name means (only when the report carries notes)
+    notes = []
+    seen_p = set()
+    for r in report["results"]:
+        if r["precision"] in seen_p or not r.get("precision_note"):
+            continue
+        seen_p.add(r["precision"])
+        notes.append((r["precision"], r["precision_note"]))
+    if notes:
+        story.append(Spacer(1, 4 * mm))
+        story.append(Paragraph("Precision key", styles["Heading3"]))
+        for name, note in notes:
+            story.append(Paragraph(f"<b>{escape(name)}</b>: {escape(note)}", small))
+
+    # simulation of the generated Verilog (only when present)
+    sim = report.get("hardware_simulation")
+    if sim:
+        story.append(Spacer(1, 4 * mm))
+        story.append(Paragraph("Hardware simulation (generated Verilog)", styles["Heading3"]))
+        exact = "YES" if sim.get("bit_exact") else "NO (see mismatches)"
+        line = [
+            f"Images checked: {sim.get('images_checked', '-')}",
+            f"Bit-exact vs Python integer model: <b>{exact}</b>",
+            f"Logit mismatches: {sim.get('logit_mismatches', '-')}",
+            f"Prediction mismatches: {sim.get('pred_mismatches', '-')}",
+        ]
+        if sim.get("hw_correct") is not None:
+            line.append(f"Correct on those images: {sim['hw_correct']}/{sim['hw_total']}")
+        if sim.get("cycles_per_image"):
+            line.append(
+                f"Cycles per image: {sim['cycles_per_image']:,} "
+                f"(about {sim['latency_us_at_assumed_clock']:.1f} us at an assumed "
+                f"{sim['clock_mhz_assumed']:.0f} MHz)")
+        if sim.get("lanes"):
+            line.append(f"MAC lanes per cycle: {sim['lanes']}")
+        for s in line:
+            story.append(Paragraph("&bull; " + s, small))
+        story.append(Paragraph(escape(sim.get("label", "")), small))
+
+    story.append(Spacer(1, 4 * mm))
     story.append(Paragraph("What this report does NOT claim", styles["Heading3"]))
-    for line in report["not_claimed"]:
-        story.append(Paragraph("&bull; " + escape(line), small))
+    for line_text in report["not_claimed"]:
+        story.append(Paragraph("&bull; " + escape(line_text), small))
 
     story.append(Spacer(1, 4 * mm))
     story.append(Paragraph("Assumptions per technology", styles["Heading3"]))
