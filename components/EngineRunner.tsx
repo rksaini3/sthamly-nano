@@ -7,6 +7,7 @@ const API = process.env.NEXT_PUBLIC_ENGINE_API_URL ?? 'http://localhost:8000'
 
 type Result = {
   precision: string
+  precision_note?: string
   tech: string
   accuracy: number
   accuracy_se: number
@@ -18,6 +19,20 @@ type Result = {
   energy_saving_pct?: number | null
   speedup_x?: number | null
   size_reduction_x?: number | null
+}
+
+type Sim = {
+  cycles_per_image?: number | null
+  clock_mhz_assumed?: number
+  latency_us_at_assumed_clock?: number | null
+  lanes?: number | null
+  images_checked?: number | null
+  logit_mismatches?: number | null
+  pred_mismatches?: number | null
+  hw_correct?: number | null
+  hw_total?: number | null
+  bit_exact: boolean
+  label: string
 }
 
 type Frame = {
@@ -36,6 +51,7 @@ type Data = {
     total_params: number
     baseline: string
     results: Result[]
+    hardware_simulation?: Sim | null
     not_claimed: string[]
   }
   placement: {
@@ -87,6 +103,17 @@ export default function EngineRunner() {
   }
 
   const frame = data?.placement.frames[frameIdx]
+  const sim = data?.report.hardware_simulation ?? null
+  const notes: { precision: string; note: string }[] = []
+  if (data) {
+    const seen = new Set<string>()
+    for (const r of data.report.results) {
+      if (r.precision_note && !seen.has(r.precision)) {
+        seen.add(r.precision)
+        notes.push({ precision: r.precision, note: r.precision_note })
+      }
+    }
+  }
   const input = 'w-20 rounded border border-line bg-surface px-2 py-1 text-ink'
 
   return (
@@ -160,6 +187,50 @@ export default function EngineRunner() {
                 </tbody>
               </table>
             </div>
+            {notes.length > 0 && (
+              <ul className="mt-4 space-y-1 text-xs text-muted">
+                {notes.map((n) => (
+                  <li key={n.precision}>
+                    <b className="font-mono text-ink">{n.precision}</b>: {n.note}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+
+          <section>
+            <h2 className="font-display text-2xl font-bold tracking-tight">Hardware simulation</h2>
+            {sim ? (
+              <div className="mt-3 space-y-1 text-sm">
+                <p>
+                  Bit-exact vs Python integer model:{' '}
+                  <b className={sim.bit_exact ? 'text-good' : 'text-bad'}>{sim.bit_exact ? 'YES' : 'NO'}</b>
+                </p>
+                <p className="text-muted">
+                  Images checked: {sim.images_checked ?? '-'} · logit mismatches: {sim.logit_mismatches ?? '-'} ·
+                  prediction mismatches: {sim.pred_mismatches ?? '-'}
+                </p>
+                {sim.hw_correct != null && (
+                  <p className="text-muted">
+                    Correct on those images: {sim.hw_correct}/{sim.hw_total}
+                  </p>
+                )}
+                {sim.cycles_per_image ? (
+                  <p className="text-muted">
+                    Cycles per image: {sim.cycles_per_image.toLocaleString()}
+                    {sim.latency_us_at_assumed_clock != null && sim.clock_mhz_assumed
+                      ? ` (about ${sim.latency_us_at_assumed_clock.toFixed(1)} us at an assumed ${sim.clock_mhz_assumed.toFixed(0)} MHz)`
+                      : ''}
+                  </p>
+                ) : null}
+                <p className="text-xs text-muted">{sim.label}</p>
+              </div>
+            ) : (
+              <p className="mt-2 text-sm text-muted">
+                Abhi koi simulation result nahi hai. Terminal me chalao: <code>python engine/run_infer.py</code> phir{' '}
+                <code>bash hardware/testbench/run_infer.sh</code>, aur backend dobara start karo.
+              </p>
+            )}
           </section>
 
           <section>
