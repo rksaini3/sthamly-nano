@@ -24,3 +24,10 @@ __pycache__/
 /work/
 /outputs/
 /reports/
+
+# Sthamly Engine: generated or downloaded files
+/samples/*.pt
+/hardware/verilog/data/
+/hardware/testbench/build/
+/hardware/testbench/build_infer/
+/results/engine_*
