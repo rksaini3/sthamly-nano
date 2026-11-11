@@ -80,7 +80,7 @@ export default async function Home() {
       </section>
 
       {/* 5. Desk */}
-      <section id="desk" className="mt-20 scroll-mt-24 rounded-2xl border bg-surface/30 p-8 text-center" aria-labelledby="desk-title">
+      <section id="desk" className="mt-20 scroll-mt-24 rounded-2xl border border-line bg-surface/30 p-8 text-center" aria-labelledby="desk-title">
         <p className="font-mono text-sm uppercase tracking-wider text-brand">100% Private Offline AI Assistant</p>
         <h2 id="desk-title" className="mx-auto mt-3 max-w-3xl font-display text-3xl font-bold tracking-tight text-ink sm:text-4xl">
           Sthamly Desk: Vakeel, CA aur Students ke liye Offline Hindi Sahayak
@@ -89,12 +89,12 @@ export default async function Home() {
           Aapke Case PDF, Financial Ledgers aur personal chat aapke computer par hi rehte hain. Zero Cloud, Zero Data Leaks.
         </p>
         <div className="mt-8 flex flex-col justify-center gap-4 sm:flex-row">
-          <Link href="/download/windows" className="btn btn-primary flex items-center justify-center gap-2 rounded-xl px-8 py-3 text-base font-semibold shadow-md">
-            <span>📥</span> Download for Windows (.exe)
-          </Link>
-          <Link href="/download/mac" className="btn btn-secondary flex items-center justify-center gap-2 rounded-xl px-8 py-3 text-base font-semibold shadow-md">
-            <span>🍏</span> Download for Mac (.dmg)
-          </Link>
+          <button type="button" disabled aria-disabled="true" className="btn btn-ghost px-8 py-3 text-base">
+            <span aria-hidden>📥</span> Windows (.exe): jaldi aa raha hai
+          </button>
+          <button type="button" disabled aria-disabled="true" className="btn btn-ghost px-8 py-3 text-base">
+            <span aria-hidden>🍏</span> Mac (.dmg): jaldi aa raha hai
+          </button>
         </div>
       </section>
     </Main>
