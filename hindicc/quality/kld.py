@@ -4,9 +4,8 @@ KLD (mean KL divergence) and same-top-p measure how far a quantized model's
 next-token distribution is from its FP16 original. Lower KLD and higher
 same-top-p are better. This is a proxy: it does not measure task accuracy.
 
-The regexes and the "clear difference" rule are the same as NanoBrain's
-scripts/trl4_bench.py and lib/verdict.ts, so numbers stay comparable across
-the two repos.
+The regexes are based on NanoBrain's scripts/trl4_bench.py. The verdict rule
+matches lib/verdict.ts, so numbers stay comparable across the two repos.
 
 Verdict rule: a gain is "clear" only when it is more than 2x the combined
 error (errors added in quadrature). Smaller positive gains are only a "hint".
@@ -20,12 +19,12 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-# Same patterns as NanoBrain's scripts/trl4_bench.py (the "±" sign is matched by
-# the non-digit character class, so both ASCII and Unicode output work).
+# The separator class allows "-" so that ASCII "+/-" works as well as the "±"
+# that llama-perplexity prints. On "±" lines the result is the same as NanoBrain's pattern.
 PATTERNS = {
-    "kld": r"Mean\s+KLD:\s*([-\d.]+)\s*[^\d\s.-]{1,3}\s*([\d.]+)",
-    "rms": r"RMS\s+\S+\s*:\s*([-\d.]+)\s*[^\d\s.-]{1,3}\s*([\d.]+)",
-    "top": r"Same top p:\s*([-\d.]+)\s*[^\d\s.-]{1,3}\s*([\d.]+)",
+    "kld": r"Mean\s+KLD:\s*([-\d.]+)\s*[^\d\s.]{1,3}\s*([\d.]+)",
+    "rms": r"RMS\s+\S+\s*:\s*([-\d.]+)\s*[^\d\s.]{1,3}\s*([\d.]+)",
+    "top": r"Same top p:\s*([-\d.]+)\s*[^\d\s.]{1,3}\s*([\d.]+)",
 }
 
 LOW_IS_BETTER = {"kld", "rms"}
