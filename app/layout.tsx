@@ -45,6 +45,13 @@ export default function RootLayout({ children }: { children: ReactNode }) {
         />
       </head>
       <body className="bg-bg text-ink font-sans antialiased min-h-screen flex flex-col">
+        <a
+          href="#content"
+          className="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-3 focus:z-50 focus:rounded-md focus:bg-raised focus:px-3 focus:py-2 focus:text-ink"
+        >
+          Seedha content par jaayein
+        </a>
+
         <header className="sticky top-0 z-30 border-b border-line bg-bg/80 backdrop-blur">
           <nav
             className="mx-auto flex h-14 w-full max-w-5xl items-center justify-between gap-3 px-4 sm:px-6"
@@ -71,7 +78,9 @@ export default function RootLayout({ children }: { children: ReactNode }) {
           </nav>
         </header>
 
-        <div className="flex-1">{children}</div>
+        <div id="content" className="flex-1">
+          {children}
+        </div>
 
         <footer className="mt-20 border-t border-line">
           <div className="mx-auto w-full max-w-5xl space-y-2 px-4 py-8 text-sm text-muted sm:px-6">
