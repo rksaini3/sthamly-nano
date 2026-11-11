@@ -1,216 +1,232 @@
-"""Hinglish kirana order-parsing eval for hindicc.
+"""Tests for quality/taskeval.py.
 
-Each item is a short Hinglish order with a labeled structured result. The model
-must return JSON, which is scored against the label. This module does not run a
-model. It takes the raw outputs, so generation (llama.cpp or any runtime) stays
-separate and the scoring can be re-run on saved outputs.
-
-Input: JSONL, one labeled item per line, for example:
-  {"id": "ord-001", "text": "2 kg atta, 1 litre tel aur 5 pav",
-   "items": [{"name": "atta", "qty": 2, "unit": "kg"},
-             {"name": "tel", "qty": 1, "unit": "litre"},
-             {"name": "pav", "qty": 5, "unit": "piece"}]}
-
-Metrics:
-  - exact match: the whole order is right (same items, qty and unit, no extras).
-  - field accuracy: correct fields (name, qty, unit) divided by all expected fields.
-  - 95% bootstrap CI for both, so small differences are not over-read.
-
-A variant is flagged as a task regression if its field accuracy is more than
-REGRESSION_PP percentage points below the FP16 baseline.
+Run from the hindicc/ root:
+    PYTHONPATH=. python -m unittest discover -s tests -p "test_*.py" -v
 """
 
-from __future__ import annotations
-
 import json
-import random
-import re
-from dataclasses import dataclass, field
+import tempfile
+import unittest
 from pathlib import Path
 
-REGRESSION_PP = 3.0
-BOOTSTRAP_SAMPLES = 1000
-BOOTSTRAP_SEED = 0
+from quality.taskeval import (
+    REGRESSION_PP,
+    EvalFormatError,
+    EvalSummary,
+    Item,
+    bootstrap_ci,
+    build_prompt,
+    evaluate,
+    load_items,
+    parse_prediction,
+    score_item,
+    task_regression,
+)
 
-PROMPT_TEMPLATE = (
-    "Parse the kirana shop order below into JSON. Return only JSON, no other text.\n"
-    'Schema: {{"items": [{{"name": string, "qty": number, "unit": string}}]}}\n'
-    "Order: {text}\n"
-    "JSON:"
+ATTA_TEL = Item(
+    id="a",
+    text="2 kg atta, 1 litre tel aur 5 pav",
+    items=(
+        {"name": "atta", "qty": 2, "unit": "kg"},
+        {"name": "tel", "qty": 1, "unit": "litre"},
+        {"name": "pav", "qty": 5, "unit": "piece"},
+    ),
 )
 
 
-class EvalFormatError(ValueError):
-    """Raised when a labeled item file is malformed."""
+def as_json(items: list[dict]) -> str:
+    return json.dumps({"items": items}, ensure_ascii=False)
 
 
-@dataclass(frozen=True)
-class Item:
-    id: str
-    text: str
-    items: tuple  # tuple of dicts with name, qty, unit
+def write_jsonl(rows: list[dict]) -> Path:
+    path = Path(tempfile.mkdtemp()) / "items.jsonl"
+    path.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows), encoding="utf-8")
+    return path
 
 
-@dataclass
-class ItemScore:
-    id: str
-    parsed: bool
-    exact: bool
-    fields_correct: int
-    fields_total: int
-
-
-@dataclass
-class EvalSummary:
-    n: int
-    parse_failures: int
-    exact_rate: float
-    exact_ci: tuple[float, float]
-    field_accuracy: float
-    field_ci: tuple[float, float]
-    scores: list[ItemScore] = field(default_factory=list)
-
-
-def load_items(path: Path) -> list[Item]:
-    items: list[Item] = []
-    seen: set[str] = set()
-    for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-        if not line.strip():
-            continue
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise EvalFormatError(f"{path}:{lineno}: invalid JSON: {exc}") from exc
-        for key in ("id", "text", "items"):
-            if key not in row:
-                raise EvalFormatError(f"{path}:{lineno}: missing '{key}'")
-        if row["id"] in seen:
-            raise EvalFormatError(f"{path}:{lineno}: duplicate id {row['id']!r}")
-        seen.add(row["id"])
-        for it in row["items"]:
-            if not all(k in it for k in ("name", "qty", "unit")):
-                raise EvalFormatError(f"{path}:{lineno}: item needs name, qty, unit: {it}")
-        items.append(Item(id=row["id"], text=row["text"], items=tuple(row["items"])))
-    if not items:
-        raise EvalFormatError(f"{path}: no items found")
-    return items
-
-
-def build_prompt(item: Item) -> str:
-    return PROMPT_TEMPLATE.format(text=item.text)
-
-
-def normalize_name(name: str) -> str:
-    return re.sub(r"\s+", " ", str(name).strip().lower())
-
-
-def normalize_unit(unit: str) -> str:
-    return str(unit).strip().lower()
-
-
-def parse_prediction(raw: str) -> list[dict] | None:
-    """Pull the JSON object out of the model output. Returns None if it is not usable."""
-    start, end = raw.find("{"), raw.rfind("}")
-    if start == -1 or end <= start:
-        return None
-    try:
-        data = json.loads(raw[start : end + 1])
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(data, dict) or not isinstance(data.get("items"), list):
-        return None
-    cleaned: list[dict] = []
-    for it in data["items"]:
-        if not isinstance(it, dict):
-            return None
-        if not isinstance(it.get("name"), str):
-            return None
-        qty = it.get("qty")
-        if isinstance(qty, bool) or not isinstance(qty, (int, float)):
-            return None
-        if not isinstance(it.get("unit"), str):
-            return None
-        cleaned.append({"name": it["name"], "qty": float(qty), "unit": it["unit"]})
-    return cleaned
-
-
-def score_item(item: Item, predicted: list[dict] | None) -> ItemScore:
-    """Match each expected item to an unused predicted item with the same name."""
-    total = 3 * len(item.items)
-    if predicted is None:
-        return ItemScore(item.id, parsed=False, exact=False, fields_correct=0, fields_total=total)
-
-    unused = list(predicted)
-    correct = 0
-    all_matched = True
-    for exp in item.items:
-        match = next(
-            (p for p in unused if normalize_name(p["name"]) == normalize_name(exp["name"])),
-            None,
+class LoadItemsTest(unittest.TestCase):
+    def test_valid_file_loads(self):
+        path = write_jsonl(
+            [{"id": "x", "text": "1 kg dal", "items": [{"name": "dal", "qty": 1, "unit": "kg"}]}]
         )
-        if match is None:
-            all_matched = False
-            continue
-        unused.remove(match)
-        correct += 1  # name matched
-        if float(match["qty"]) == float(exp["qty"]):
-            correct += 1
-        else:
-            all_matched = False
-        if normalize_unit(match["unit"]) == normalize_unit(exp["unit"]):
-            correct += 1
-        else:
-            all_matched = False
+        items = load_items(path)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].id, "x")
 
-    exact = all_matched and not unused and len(predicted) == len(item.items)
-    return ItemScore(item.id, parsed=True, exact=exact, fields_correct=correct, fields_total=total)
+    def test_missing_key_raises(self):
+        path = write_jsonl([{"id": "x", "items": []}])
+        with self.assertRaises(EvalFormatError):
+            load_items(path)
 
+    def test_duplicate_id_raises(self):
+        row = {"id": "x", "text": "t", "items": [{"name": "dal", "qty": 1, "unit": "kg"}]}
+        with self.assertRaises(EvalFormatError):
+            load_items(write_jsonl([row, row]))
 
-def bootstrap_ci(pairs: list[tuple[float, float]], seed: int = BOOTSTRAP_SEED) -> tuple[float, float]:
-    """95% CI for sum(num) / sum(den), resampling items with replacement."""
-    if not pairs:
-        return (0.0, 0.0)
-    rng = random.Random(seed)
-    n = len(pairs)
-    stats = []
-    for _ in range(BOOTSTRAP_SAMPLES):
-        sample = [pairs[rng.randrange(n)] for _ in range(n)]
-        num = sum(p[0] for p in sample)
-        den = sum(p[1] for p in sample)
-        if den:
-            stats.append(num / den)
-    stats.sort()
-    lo = stats[int(0.025 * len(stats))]
-    hi = stats[min(len(stats) - 1, int(0.975 * len(stats)))]
-    return (lo, hi)
+    def test_item_missing_field_raises(self):
+        path = write_jsonl([{"id": "x", "text": "t", "items": [{"name": "dal", "qty": 1}]}])
+        with self.assertRaises(EvalFormatError):
+            load_items(path)
+
+    def test_empty_file_raises(self):
+        path = Path(tempfile.mkdtemp()) / "empty.jsonl"
+        path.write_text("\n\n", encoding="utf-8")
+        with self.assertRaises(EvalFormatError):
+            load_items(path)
 
 
-def evaluate(items: list[Item], raw_outputs: dict[str, str]) -> EvalSummary:
-    """Score raw model outputs against labels. A missing output counts as a parse failure."""
-    scores: list[ItemScore] = []
-    for item in items:
-        raw = raw_outputs.get(item.id, "")
-        scores.append(score_item(item, parse_prediction(raw)))
+class PromptTest(unittest.TestCase):
+    def test_prompt_contains_order_text(self):
+        self.assertIn("2 kg atta", build_prompt(ATTA_TEL))
 
-    n = len(scores)
-    exact_pairs = [(1.0 if s.exact else 0.0, 1.0) for s in scores]
-    field_pairs = [(float(s.fields_correct), float(s.fields_total)) for s in scores]
-    exact_rate = sum(p[0] for p in exact_pairs) / n
-    field_total = sum(p[1] for p in field_pairs)
-    field_acc = sum(p[0] for p in field_pairs) / field_total if field_total else 0.0
 
+class ParsePredictionTest(unittest.TestCase):
+    def test_plain_json(self):
+        out = parse_prediction(as_json([{"name": "atta", "qty": 2, "unit": "kg"}]))
+        self.assertEqual(out, [{"name": "atta", "qty": 2.0, "unit": "kg"}])
+
+    def test_json_with_preamble_and_fence(self):
+        raw = "Sure! ```json\n" + as_json([{"name": "dal", "qty": 1, "unit": "kg"}]) + "\n```"
+        self.assertIsNotNone(parse_prediction(raw))
+
+    def test_no_json_returns_none(self):
+        self.assertIsNone(parse_prediction("I cannot do that"))
+
+    def test_broken_json_returns_none(self):
+        self.assertIsNone(parse_prediction('{"items": [{"name": "dal"'))
+
+    def test_qty_as_string_is_rejected(self):
+        self.assertIsNone(parse_prediction(as_json([{"name": "dal", "qty": "2", "unit": "kg"}])))
+
+    def test_qty_as_bool_is_rejected(self):
+        self.assertIsNone(parse_prediction(as_json([{"name": "dal", "qty": True, "unit": "kg"}])))
+
+    def test_missing_items_key_returns_none(self):
+        self.assertIsNone(parse_prediction('{"orders": []}'))
+
+
+class ScoreItemTest(unittest.TestCase):
+    def test_perfect_match_is_exact(self):
+        pred = [
+            {"name": "atta", "qty": 2.0, "unit": "kg"},
+            {"name": "tel", "qty": 1.0, "unit": "litre"},
+            {"name": "pav", "qty": 5.0, "unit": "piece"},
+        ]
+        s = score_item(ATTA_TEL, pred)
+        self.assertTrue(s.exact)
+        self.assertEqual((s.fields_correct, s.fields_total), (9, 9))
+
+    def test_case_and_spacing_are_ignored(self):
+        pred = [
+            {"name": "  ATTA ", "qty": 2.0, "unit": "KG"},
+            {"name": "tel", "qty": 1.0, "unit": "Litre"},
+            {"name": "pav", "qty": 5.0, "unit": "piece"},
+        ]
+        self.assertTrue(score_item(ATTA_TEL, pred).exact)
+
+    def test_wrong_qty_is_not_exact_but_partial_credit(self):
+        pred = [
+            {"name": "atta", "qty": 3.0, "unit": "kg"},  # wrong qty
+            {"name": "tel", "qty": 1.0, "unit": "litre"},
+            {"name": "pav", "qty": 5.0, "unit": "piece"},
+        ]
+        s = score_item(ATTA_TEL, pred)
+        self.assertFalse(s.exact)
+        self.assertEqual(s.fields_correct, 8)  # name still matched, qty wrong
+
+    def test_extra_item_is_not_exact(self):
+        pred = [
+            {"name": "atta", "qty": 2.0, "unit": "kg"},
+            {"name": "tel", "qty": 1.0, "unit": "litre"},
+            {"name": "pav", "qty": 5.0, "unit": "piece"},
+            {"name": "namak", "qty": 1.0, "unit": "kg"},
+        ]
+        self.assertFalse(score_item(ATTA_TEL, pred).exact)
+
+    def test_missing_item_loses_its_fields(self):
+        pred = [
+            {"name": "atta", "qty": 2.0, "unit": "kg"},
+            {"name": "tel", "qty": 1.0, "unit": "litre"},
+        ]
+        s = score_item(ATTA_TEL, pred)
+        self.assertFalse(s.exact)
+        self.assertEqual(s.fields_correct, 6)  # pav's 3 fields are lost
+
+    def test_unparsed_output_scores_zero(self):
+        s = score_item(ATTA_TEL, None)
+        self.assertFalse(s.parsed)
+        self.assertEqual(s.fields_correct, 0)
+        self.assertEqual(s.fields_total, 9)
+
+
+class EvaluateTest(unittest.TestCase):
+    def test_missing_output_counts_as_parse_failure(self):
+        summary = evaluate([ATTA_TEL], {})
+        self.assertEqual(summary.parse_failures, 1)
+        self.assertEqual(summary.exact_rate, 0.0)
+        self.assertEqual(summary.field_accuracy, 0.0)
+
+    def test_all_correct_gives_full_marks(self):
+        good = as_json(
+            [
+                {"name": "atta", "qty": 2, "unit": "kg"},
+                {"name": "tel", "qty": 1, "unit": "litre"},
+                {"name": "pav", "qty": 5, "unit": "piece"},
+            ]
+        )
+        summary = evaluate([ATTA_TEL], {"a": good})
+        self.assertEqual(summary.exact_rate, 1.0)
+        self.assertEqual(summary.field_accuracy, 1.0)
+
+    def test_ci_stays_inside_zero_and_one(self):
+        summary = evaluate([ATTA_TEL], {})
+        lo, hi = summary.field_ci
+        self.assertGreaterEqual(lo, 0.0)
+        self.assertLessEqual(hi, 1.0)
+
+
+class BootstrapTest(unittest.TestCase):
+    def test_same_seed_gives_same_interval(self):
+        pairs = [(1.0, 1.0), (0.0, 1.0), (1.0, 1.0), (0.0, 1.0)]
+        self.assertEqual(bootstrap_ci(pairs, seed=7), bootstrap_ci(pairs, seed=7))
+
+    def test_empty_input_returns_zeros(self):
+        self.assertEqual(bootstrap_ci([]), (0.0, 0.0))
+
+    def test_interval_contains_point_estimate(self):
+        pairs = [(1.0, 1.0)] * 30 + [(0.0, 1.0)] * 10
+        lo, hi = bootstrap_ci(pairs)
+        self.assertLessEqual(lo, 0.75)
+        self.assertGreaterEqual(hi, 0.75)
+
+
+def _summary(field_accuracy: float) -> EvalSummary:
     return EvalSummary(
-        n=n,
-        parse_failures=sum(1 for s in scores if not s.parsed),
-        exact_rate=exact_rate,
-        exact_ci=bootstrap_ci(exact_pairs),
-        field_accuracy=field_acc,
-        field_ci=bootstrap_ci(field_pairs),
-        scores=scores,
+        n=1,
+        parse_failures=0,
+        exact_rate=0.0,
+        exact_ci=(0.0, 0.0),
+        field_accuracy=field_accuracy,
+        field_ci=(0.0, 0.0),
     )
 
 
-def task_regression(baseline: EvalSummary, variant: EvalSummary) -> tuple[float, bool]:
-    """Drop in field accuracy (percentage points) and whether it exceeds REGRESSION_PP."""
-    drop_pp = (baseline.field_accuracy - variant.field_accuracy) * 100
-    return drop_pp, drop_pp > REGRESSION_PP
+class RegressionTest(unittest.TestCase):
+    def test_drop_above_threshold_is_flagged(self):
+        drop, flagged = task_regression(_summary(0.90), _summary(0.90 - 0.05))
+        self.assertAlmostEqual(drop, 5.0, places=6)
+        self.assertTrue(flagged)
+
+    def test_drop_exactly_at_threshold_is_not_flagged(self):
+        drop, flagged = task_regression(_summary(0.90), _summary(0.90 - REGRESSION_PP / 100))
+        self.assertAlmostEqual(drop, REGRESSION_PP, places=6)
+        self.assertFalse(flagged)
+
+    def test_improvement_is_negative_drop_and_not_flagged(self):
+        drop, flagged = task_regression(_summary(0.80), _summary(0.90))
+        self.assertLess(drop, 0)
+        self.assertFalse(flagged)
+
+
+if __name__ == "__main__":
+    unittest.main()
