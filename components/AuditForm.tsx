@@ -137,13 +137,13 @@ export default function AuditForm({ disabled = false, note }: { disabled?: boole
       </p>
 
       {error && (
-        <p id="audit-error" role="alert" className="mt-3 text-sm text-red-500">
+        <p id="audit-error" role="alert" className="mt-3 text-sm text-bad">
           ⚠️ {error}
         </p>
       )}
 
       {job && (
-        <div aria-live="polite" className="mt-4 space-y-2 rounded-lg border border-line bg-surface p-4 font-mono text-xs text-ink">
+        <div className="mt-4 space-y-2 rounded-lg border border-line bg-surface p-4 font-mono text-xs text-ink">
           <p className="text-muted">// {job.hf_model} · {job.status}</p>
 
           {!finished && (
@@ -161,7 +161,7 @@ export default function AuditForm({ disabled = false, note }: { disabled?: boole
                   style={{ width: `${Math.min(100, Math.max(0, job.progress))}%` }}
                 />
               </div>
-              <p>
+              <p aria-live="polite">
                 {job.step ?? (job.status === 'queued' ? 'Line me hai' : 'Chal raha hai')} · {job.progress}%
               </p>
               {job.status === 'queued' && job.queue_position !== null && (
@@ -226,7 +226,7 @@ export default function AuditForm({ disabled = false, note }: { disabled?: boole
               <a
                 href={`/api/pdf?job=${job.id}`}
                 download
-                className="btn btn-secondary py-2.5 text-center text-xs font-bold"
+                className="btn btn-ghost py-2.5 text-center text-xs font-bold"
               >
                 📄 PDF report download
               </a>
