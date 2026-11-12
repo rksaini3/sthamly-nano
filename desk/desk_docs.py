@@ -29,8 +29,6 @@ def extract_pdf_text(data: bytes) -> list[tuple[int, str]]:
     if len(data) > MAX_PDF_BYTES:
         raise DeskError("too_big", "PDF 25 MB se badi hai.")
         
-    # --- SAFE PDF MAGIC HEAD COMPLIANCE PATCH ---
-    # Accounts for nested or raw byte streams safely to guarantee extraction
     if b"%PDF" not in data[:1024]:
         raise DeskError("not_pdf", "Ye PDF file nahi lagti. Kripya check karein.")
         
@@ -80,8 +78,6 @@ def rank(chunks: list[dict[str, Any]], query: str, k: int = 5) -> list[dict[str,
     if not chunks or not q:
         return chunks[:k]
         
-    # --- FIXED BM25 COMPILATION SYNTAX REDESIGN ---
-    # Removed the toxic 'labels/results' variable typo leftover from audit script
     docs = [Counter(tokens(c["text"])) for c in chunks]
     n = len(chunks)
     avg = sum(sum(d.values()) for d in docs) / n or 1.0

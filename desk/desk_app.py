@@ -89,10 +89,8 @@ class Desk:
             if task is None:
                 raise DeskError("bad_action", "Ye button algorithm array me nahi mila.")
 
-            if profile == "lawyer" and action not in ["draft_bail", "draft_notice", "extract_ratios"] and not self.dev:
-                raise DeskError("bad_action", "Ye legal shortcut is license par allowed nahi hai.")
-            elif profile == "finance" and action not in ["balance_analysis", "statement_summary"] and not self.dev:
-                raise DeskError("bad_action", "Ye finance shortcut is license par allowed nahi hai.")
+            if not self.dev and not desk_prompts.allowed(profile, action):
+                raise DeskError("bad_action", "Ye shortcut is license par allowed nahi hai.")
 
             question = task + (f"\n\nUser ki extra baat: {message}" if message else "")
         else:

@@ -1,0 +1,4 @@
+# Desk software ki zaroorat (Windows/Mac par user ke computer me).
+# llama-server ek alag binary hai, pip se nahi aata.
+pypdf>=4.0
+keyring>=25.0

@@ -92,7 +92,6 @@ $('#q').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('#se
 $('#up').onclick=()=>$('#file').click();
 $('#file').onchange=async e=>{$('#uperr').textContent='';
   for(const f of e.target.files){
-    // SAFE FILE READER PATCH: Find the first comma index instead of split array matrix slicing
     const data=await new Promise(res=>{const r=new FileReader();r.onload=()=> {
       const s = String(r.result);
       const idx = s.indexOf(',');

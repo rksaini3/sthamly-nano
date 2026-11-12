@@ -4,18 +4,13 @@ import type { Metadata, Viewport } from 'next'
 import type { ReactNode } from 'react'
 
 export const metadata: Metadata = {
-  title: 'Sthamly NanoBrain: Hindi quantization quality',
-  description: 'Quantized models Hindi par FP16 se kitna door jaate hain: naapa hua, error bars ke saath.',
+  title: 'Sthamly Legal Desk',
+  description: 'Vakeel ke liye offline AI sahayak. Aapki PDF aapke computer par hi rehti hai.',
 }
 
 export const viewport: Viewport = { themeColor: '#080C16' }
 
-const NAV = [
-  { href: '/#audit', label: 'Audit' },
-  { href: '/leaderboard', label: 'Leaderboard' },
-  { href: '/benchmark', label: 'Benchmark' },
-  { href: '/#desk', label: 'Desk' },
-]
+const NAV = [{ href: '/#desk', label: 'Desk' }]
 
 function Logo() {
   return (
@@ -34,9 +29,9 @@ function Logo() {
 
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
-    <html lang="en">
+    <html lang="hi">
       <head>
-        {/* Fonts are optional: if they do not load, the system fonts in tailwind.config.js are used. */}
+        {/* Fonts optional hain: nahi load hue to tailwind.config.js ke system fonts chalte hain. */}
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="" />
         <link
@@ -59,9 +54,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
           >
             <Link href="/" className="flex items-center gap-2.5 whitespace-nowrap font-display text-lg font-bold tracking-tight">
               <Logo />
-              <span>
-                Sthamly<span className="hidden text-muted sm:inline"> NanoBrain</span>
-              </span>
+              <span>Sthamly</span>
             </Link>
             <ul className="flex items-center text-[0.8rem] sm:gap-2 sm:text-sm">
               {NAV.map((n) => (
@@ -83,16 +76,8 @@ export default function RootLayout({ children }: { children: ReactNode }) {
         </div>
 
         <footer className="mt-20 border-t border-line">
-          <div className="mx-auto w-full max-w-5xl space-y-2 px-4 py-8 text-sm text-muted sm:px-6">
-            <p>
-              Ye naap FP16 se distribution ka fark hai (proxy). Hindi sawal-jawab ya summary par accuracy abhi naapi
-              nahi gayi.
-            </p>
-            <p>
-              <a className="underline underline-offset-2 hover:text-ink" href="https://github.com/rksaini3/sthamly-nano">
-                Code aur methodology (GitHub)
-              </a>
-            </p>
+          <div className="mx-auto w-full max-w-5xl px-4 py-8 text-sm text-muted sm:px-6">
+            <p>Ye kanooni salah nahi hai. Drafting aur analysis me madad karta hai; output ko kisi qualified vakeel se verify karwayein.</p>
           </div>
         </footer>
       </body>

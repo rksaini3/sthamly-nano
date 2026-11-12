@@ -15,8 +15,11 @@ import sys
 import webbrowser
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
+FROZEN = bool(getattr(sys, "frozen", False))  # PyInstaller exe ke andar chal rahe hain
+HERE = Path(__file__).resolve().parent  # source files
+BUNDLE = Path(getattr(sys, "_MEIPASS", HERE))  # exe ke andar bundled files (desk_config.json)
+APP_DIR = Path(sys.executable).resolve().parent if FROZEN else HERE  # model aur llama-server yahan dhoondhe jaate hain
+sys.path.insert(0, str(BUNDLE))
 
 from desk_app import Desk, make_server  # noqa: E402
 from desk_errors import DeskError  # noqa: E402
@@ -29,7 +32,7 @@ DEV_ENV = "STHAMLY_DEV"  # sirf developer ke computer par "1" hota hai. Shipped 
 def load_config() -> dict:
     """desk_config.json (is file ke saath) < ~/.sthamly/config.json < environment."""
     cfg: dict = {}
-    for p in (HERE / "desk_config.json", HOME / "config.json"):
+    for p in (BUNDLE / "desk_config.json", HOME / "config.json"):
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
             if isinstance(data, dict):
@@ -50,7 +53,7 @@ def find_model(arg: str | None) -> Path | None:
     if arg:
         p = Path(arg)
         return p if p.is_file() else None
-    for d in (HERE / "models", HOME / "models", HERE, HERE.parent / "dist"):
+    for d in (APP_DIR / "models", HOME / "models", APP_DIR):
         found = sorted(d.rglob("*.gguf")) if d.is_dir() else []
         if found:
             return found[0]
@@ -58,7 +61,8 @@ def find_model(arg: str | None) -> Path | None:
 
 
 def dev_mode_allowed() -> bool:
-    return os.environ.get(DEV_ENV) == "1"
+    # Exe (FROZEN) mein developer mode kabhi nahi khulta, env variable se bhi nahi.
+    return (not FROZEN) and os.environ.get(DEV_ENV) == "1"
 
 
 def check(args: argparse.Namespace, cfg: dict) -> int:
@@ -76,7 +80,7 @@ def check(args: argparse.Namespace, cfg: dict) -> int:
     except ImportError:
         line(False, "pypdf", "pip install pypdf")
 
-    server = args.llama_server or find_llama_server(HERE)
+    server = args.llama_server or find_llama_server(APP_DIR)
     line(bool(server), f"llama-server{': ' + str(server) if server else ''}",
          "llama.cpp build karo (bash scripts/setup.sh) ya release se llama-server download karke is folder me rakho")
 
@@ -133,7 +137,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.llama_url:
         llama_url = args.llama_url.rstrip("/")
     else:
-        binary = args.llama_server or find_llama_server(HERE)
+        binary = args.llama_server or find_llama_server(APP_DIR)
         if binary is None or not Path(binary).is_file():
             print("llama-server nahi mila. --llama-server path do, ya llama-server ko desk folder me rakho.")
             return 1
