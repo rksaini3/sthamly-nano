@@ -1,6 +1,6 @@
 """Activation key: Supabase verify_client_activation() se jaanch, aur local cache (offline bhi chalta hai).
 
-Blueprint B7 ke hisaab se:
+Niyam (docs/PRIVACY.md bhi dekho):
 - har RECHECK_DAYS (30) din mein server se dobara jaanch.
 - server tak na pahunch paayein to GRACE_DAYS (14) din ki chhoot. Uske baad sirf padhne/niryaat ka mode
   (read_only=True). Desk_app ko read_only ka matlab AI action band karna hai.
@@ -10,9 +10,9 @@ Blueprint B7 ke hisaab se:
 - ghadi peeche karne par (rollback) cache rad.
 
 Honest limit: local cache puri tarah bharosemand nahi ho sakta. Poori suraksha ke liye server Ed25519-signed
-license token dega (blueprint B7-2). Ye file us token ke liye taiyaar hai, par token abhi server par nahi hai.
+license token dega (TODO: server signed token, abhi nahi bana). Ye file us token ke liye taiyaar hai, par token abhi server par nahi hai.
 
-Server (db/schema_v3.sql) key ka sirf hash rakhta hai aur device limit lagata hai.
+Server (db/schema.sql) key ka sirf hash rakhta hai aur device limit lagata hai.
 Yahan sirf PUBLIC anon key chalti hai. service_role key is software me kabhi nahi hoti.
 """
 from __future__ import annotations
@@ -31,8 +31,9 @@ from pathlib import Path
 from typing import Any
 
 from desk_errors import DeskError
+import desk_prompts
 
-RECHECK_DAYS = 30        # itne din baad server se dobara poochte hain (blueprint B7)
+RECHECK_DAYS = 30        # itne din baad server se dobara poochte hain
 GRACE_DAYS = 14          # server na mile to itne din tak poora access; uske baad read_only
 CLOCK_TOLERANCE = 3600   # seconds. Ghadi isse zyada peeche gayi to cache rad
 DAY = 86400.0
@@ -113,7 +114,7 @@ def public(data: dict[str, Any]) -> dict[str, Any]:
     return {
         "profile": data.get("profile"),
         "label": data.get("label") or f"Sthamly {str(data.get('profile')).capitalize()} Desk",
-        "actions": data.get("actions") or [],
+        "actions": data.get("actions") or desk_prompts.button_labels(data.get("profile")),
         "disclaimer": data.get("disclaimer") or "100% Private Offline Workspace footprint.",
         "system_prompt": data.get("system_prompt") or payload_box.get("system_prompt"),
     }
@@ -254,7 +255,7 @@ class LicenseStore:
     def current(self) -> dict[str, Any] | None:
         """
         Chalu license ya None. Keys: profile, label, actions, disclaimer, system_prompt, read_only.
-        read_only=True: sirf padhne aur niryaat ka mode (blueprint B7-3). AI actions band karo.
+        read_only=True: sirf padhne aur niryaat ka mode AI actions band karo.
         """
         if self.dev:
             return {**DEV_PROFILE, "read_only": False}
