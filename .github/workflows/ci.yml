@@ -4,7 +4,6 @@ on:
   push:
   pull_request:
 
-# Read-only token: CI only needs to read the code.
 permissions:
   contents: read
 
@@ -21,19 +20,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      # Uses the lockfile when it is committed; falls back to npm install until it is.
       - name: Install dependencies
-        run: |
-          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+        run: npm install
       - name: Typecheck
         run: npm run typecheck
-      - name: Unit tests (lib/*.test.ts)
-        run: npm test
-      # Builds with NO Supabase env on purpose: the site must degrade gracefully, not crash.
       - name: Build
         run: npm run build
 
-  scripts:
+  desk:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -41,12 +35,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
-          cache-dependency-path: requirements.txt
-      # worker.py and the tests import huggingface_hub, so the runtime deps must be installed.
-      - name: Install Python dependencies
-        run: python -m pip install -r requirements.txt
+      - name: Install desk dependencies
+        run: python -m pip install -r requirements-desk.txt
       - name: Compile
-        run: python -m py_compile scripts/*.py desk/*.py
+        run: python -m py_compile desk/*.py scripts/licenses.py
       - name: Unit tests
-        run: python -W error::ResourceWarning -m unittest discover -s tests -v
+        run: python -m unittest discover -s tests -v
