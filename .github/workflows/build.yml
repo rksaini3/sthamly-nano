@@ -1,43 +1,29 @@
-name: Automated Windows Compiler Engine
+name: build-windows
 
 on:
   push:
-    branches: [ main ] # Jaise hi code badlega, ye auto-run hoga
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
-  build:
+  exe:
     runs-on: windows-latest
-
+    timeout-minutes: 30
     steps:
-    - name: Clone Repository Footprint
-      uses: actions/checkout@v4
-
-    - name: Initialize Python Production Environment
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.10'
-
-    - name: Install PyInstaller and PDF Modules
-      run: |
-        python -m pip install --upgrade pip
-        pip install pyinstaller pypdf
-
-    - name: Freeze Python Code into Clickable Binary (.exe)
-      run: |
-        pyinstaller --onefile --name="SthamlyDesk" --hidden-import=pypdf desk/sthamly_desk.py
-
-    - name: Generate Dynamic Time Tag
-      id: tag
-      run: |
-        echo "version=v1.0.${{ github.run_number }}" >> $env:GITHUB_OUTPUT
-
-    - name: Generate Direct Public Asset Download Link
-      uses: softprops/action-gh-release@v2
-      with:
-        files: dist/SthamlyDesk.exe
-        tag_name: ${{ steps.tag.outputs.version }}
-        name: Sthamly Desk Release ${{ steps.tag.outputs.version }}
-        draft: false
-        prerelease: false
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: python -m pip install -r requirements-desk.txt pyinstaller
+      - name: Build exe
+        run: pyinstaller --onefile --name SthamlyDesk --hidden-import pypdf --hidden-import keyring --add-data "desk/desk_config.json;." desk/sthamly_desk.py
+      - name: Draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: dist/SthamlyDesk.exe

@@ -76,7 +76,7 @@ class LlamaServer:
             "--port", str(self.port),
             "-c", str(self.ctx), 
             "-t", str(self.threads),
-            "--flash-attn" # Force speed optimization for reading large legal/finance text structures
+            "--flash-attn", "on", # Force speed optimization for reading large legal/finance text structures
         ]
         
         # Smart hardware acceleration auto-detect matrix for native laptop inference speed
